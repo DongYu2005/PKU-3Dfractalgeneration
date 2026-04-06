@@ -1,0 +1,11 @@
+data/
+__pycache__/
+*.pyc
+*.pth
+*.ckpt
+*.obj
+wandb/
+outputs/
+logs/
+octgpt/
+saved_ckpt/
