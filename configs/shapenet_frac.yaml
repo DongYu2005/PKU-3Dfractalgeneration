@@ -27,7 +27,7 @@ SOLVER:
 
 DATA:
   train:
-    num_workers: 8
+    num_workers: 16
     pin_memory: True
     name: &name shapenet
 
@@ -50,7 +50,7 @@ DATA:
     filelist: &filelist data/ShapeNet/filelist/train_airplane.txt
     load_pointcloud: True
     load_sdf: False       # No longer need SDF query points for training
-    batch_size: 1
+    batch_size: 2
     shuffle: True
 
   test:

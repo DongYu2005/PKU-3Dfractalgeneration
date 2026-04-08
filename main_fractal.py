@@ -101,7 +101,7 @@ class FractalSolver(Solver):
         return {"test/" + k: v for k, v in output.items()}
 
     def test_epoch(self, epoch):
-        if epoch % 50 != 0:
+        if epoch % 20 != 0:
             return
         super().test_epoch(epoch)
         if self.is_master:
