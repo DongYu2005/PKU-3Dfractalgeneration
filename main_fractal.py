@@ -130,6 +130,7 @@ class FractalSolver(Solver):
                 batch_size=1, device=self.device,
                 temperature=0.8, vqvae=vqvae)
 
+        print(f"Generated octree with {octree.nnum} nodes and VQ code shape {vq_code.shape}")
         if vq_code.shape[0] == 0:
             return
 

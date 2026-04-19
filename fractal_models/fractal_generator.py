@@ -1,18 +1,11 @@
 """
-FractalGenerator: Fractal octree generation with VQ-VAE discrete token prediction.
+FractalGenerator v4: Fractal octree generation with VQ-VAE token prediction.
 
-Architecture:
-  1. Learnable root embedding + spatial position encoding at full_depth
-  2. Per-level split prediction + LocalCrossAttentionExpander for feature expansion
-  3. Leaf-level OctFormer transformer for feature refinement
-  4. VQ token prediction head (cross-entropy on BSQ indices)
-  5. Pre-trained frozen VQ-VAE decoder for mesh extraction
-
-Key design:
-  - Fractal hierarchical expansion: depth 3 → depth_stop (e.g. 6)
-  - Split + prune at each level (like FRACTAL3DGEN)
-  - Leaf features → predict discrete VQ codes → VQ-VAE decoder → SDF → mesh
-  - Position encoding at every level so nodes know WHERE they are in space
+Changes from v3:
+  - Focal Loss for split prediction (handles class imbalance)
+  - Per-level OctFormerStage (1 block) for node communication before split
+  - Threshold-based split in generation (prob > 0.3 instead of argmax)
+  - Position encoding at every level
 """
 
 import sys
@@ -23,7 +16,6 @@ import torch.nn.functional as F
 
 from torch.nn import LayerNorm
 
-# Ensure octgpt is importable
 _octgpt_path = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'octgpt'))
 if _octgpt_path not in sys.path:
@@ -37,12 +29,48 @@ from octgpt.utils.utils import depth2batch, batch2depth
 
 
 # ============================================================================
-# Task 1: Transformer-based Feature Expansion (Local Cross-Attention)
+# Focal Loss (handles extreme class imbalance in split prediction)
+# ============================================================================
+
+class FocalLoss(nn.Module):
+    """Focal Loss: -alpha * (1-p)^gamma * log(p)
+
+    Downweights easy negatives (empty nodes), forces model to focus on
+    the hard boundary nodes where split decisions actually matter.
+    """
+
+    def __init__(self, alpha: float = 0.75, gamma: float = 2.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            logits: (N, 2) raw predictions
+            targets: (N,) with values in {0, 1}
+        """
+        probs = F.softmax(logits, dim=-1)
+        # Gather the probability of the true class
+        pt = probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+
+        # Per-sample alpha: alpha for positive (1), 1-alpha for negative (0)
+        alpha_t = torch.where(targets == 1, self.alpha, 1 - self.alpha)
+
+        # Focal modulation: downweight easy samples
+        focal_weight = alpha_t * (1 - pt) ** self.gamma
+
+        # Standard CE per sample
+        ce = F.cross_entropy(logits, targets, reduction='none')
+
+        return (focal_weight * ce).mean()
+
+
+# ============================================================================
+# Transformer-based Feature Expansion (Local Cross-Attention)
 # ============================================================================
 
 class OctantPositionEmbedding(nn.Module):
-    """Fixed 3D position embedding for the 8 octant children."""
-
     def __init__(self, dim: int):
         super().__init__()
         offsets = torch.tensor([
@@ -52,12 +80,12 @@ class OctantPositionEmbedding(nn.Module):
         self.register_buffer("offsets", offsets)
         self.proj = nn.Linear(3, dim)
 
-    def forward(self) -> torch.Tensor:
+    def forward(self):
         return self.proj(self.offsets)
 
 
 class LocalCrossAttentionExpander(nn.Module):
-    """Local cross-attention block: parent (N, C) -> children (N*8, C)."""
+    """Parent (N, C) -> children (N*8, C) via local cross-attention."""
 
     def __init__(self, dim: int, num_heads: int = 4, ffn_ratio: float = 2.0):
         super().__init__()
@@ -74,7 +102,7 @@ class LocalCrossAttentionExpander(nn.Module):
         self.ffn = nn.Sequential(
             nn.Linear(dim, ffn_dim), nn.GELU(), nn.Linear(ffn_dim, dim))
 
-    def forward(self, parent_features: torch.Tensor) -> torch.Tensor:
+    def forward(self, parent_features):
         N = parent_features.shape[0]
         if N == 0:
             return torch.zeros(0, self.dim, device=parent_features.device)
@@ -84,25 +112,19 @@ class LocalCrossAttentionExpander(nn.Module):
             context = parent_features
         q = self.octant_queries.unsqueeze(0).expand(N, -1, -1)
         q = q + self.octant_pos_emb().unsqueeze(0)
-        q_normed = self.norm_q(q)
-        kv_normed = self.norm_kv(context)
         attn_out, _ = self.cross_attn(
-            query=q_normed, key=kv_normed, value=kv_normed)
+            query=self.norm_q(q), key=self.norm_kv(context),
+            value=self.norm_kv(context))
         children = q + attn_out
         children = children + self.ffn(self.norm_ffn(children))
         return children.reshape(N * 8, self.dim)
 
 
 # ============================================================================
-# FractalGenerator (main model — VQ-VAE version)
+# FractalGenerator v4
 # ============================================================================
 
 class FractalGenerator(nn.Module):
-    """Fractal octree generator with VQ token prediction at leaf level.
-
-    Training: split loss (CE) + VQ token loss (CE on BSQ indices)
-    Inference: fractal expand → predict VQ indices → VQ-VAE decode → mesh
-    """
 
     def __init__(
         self,
@@ -120,11 +142,14 @@ class FractalGenerator(nn.Module):
         use_swin: bool = True,
         split_weight: float = 1.0,
         vq_weight: float = 1.0,
-        # VQ-VAE config (BSQ: 32 groups, each binary)
         vq_groups: int = 32,
         vq_size: int = 2,
-        # Task 1: Expander attention heads
         expander_num_heads: int = 4,
+        # Focal Loss params
+        focal_alpha: float = 0.75,
+        focal_gamma: float = 2.0,
+        # Generation threshold for split
+        split_threshold: float = 0.3,
         **kwargs,
     ):
         super().__init__()
@@ -139,19 +164,38 @@ class FractalGenerator(nn.Module):
         self.vq_weight = vq_weight
         self.vq_groups = vq_groups
         self.vq_size = vq_size
+        self.split_threshold = split_threshold
 
         PosEmb = eval(pos_emb_type)
         Norm = eval(norm_type)
+
+        # ---- Focal Loss for split ----
+        self.focal_loss = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
 
         # ---- learnable root features ----
         self.root_embedding = nn.Parameter(torch.zeros(1, feature_dim))
         nn.init.normal_(self.root_embedding, std=0.02)
 
-        # ---- spatial position projection (xyz -> feature_dim) ----
-        # Injects octree node coordinates so each node knows WHERE it is
+        # ---- spatial position projection ----
         self.pos_proj = nn.Linear(3, feature_dim)
 
-        # ---- leaf-level transformer ----
+        # ---- per-level mid transformers (node communication before split) ----
+        # 1 block each — lightweight, just enough for neighbors to talk
+        self.mid_transformers = nn.ModuleList([
+            OctFormerStage(
+                dim=feature_dim, num_heads=num_heads,
+                num_blocks=1,
+                patch_size=patch_size, dilation=dilation,
+                attn_drop=drop_rate, proj_drop=drop_rate, dropout=drop_rate,
+                nempty=False, use_checkpoint=use_checkpoint,
+                use_swin=use_swin, pos_emb=PosEmb, norm_layer=Norm)
+            for _ in range(self.num_levels)
+        ])
+        self.mid_norms = nn.ModuleList([
+            Norm(feature_dim) for _ in range(self.num_levels)
+        ])
+
+        # ---- leaf-level transformer (6 blocks for final refinement) ----
         self.leaf_transformer = OctFormerStage(
             dim=feature_dim, num_heads=num_heads,
             num_blocks=blocks_per_level, patch_size=patch_size,
@@ -166,7 +210,7 @@ class FractalGenerator(nn.Module):
             nn.Linear(feature_dim, 2) for _ in range(self.num_levels)
         ])
 
-        # ---- per-level feature expanders (Task 1) ----
+        # ---- per-level feature expanders ----
         self.feature_expanders = nn.ModuleList([
             LocalCrossAttentionExpander(
                 dim=feature_dim, num_heads=expander_num_heads)
@@ -179,8 +223,6 @@ class FractalGenerator(nn.Module):
 
         # ---- VQ token prediction head ----
         self.vq_head = nn.Linear(feature_dim, vq_groups * vq_size)
-
-        # ---- VQ code projection ----
         self.vq_proj = nn.Linear(vq_groups, feature_dim)
 
         self.apply(self._init_weights)
@@ -200,22 +242,25 @@ class FractalGenerator(nn.Module):
     # ------------------------------------------------------------------
 
     def _get_pos_embed(self, octree, depth):
-        """Extract normalized (x, y, z) coordinates and project to feature_dim.
-
-        Each node gets a unique spatial embedding so the model knows
-        WHERE in 3D space this node sits.
-        """
         ox, oy, oz, ob = octree.xyzb(depth)
         scale = 2 ** depth
         pos = torch.stack([
-            ox.float() / scale,
-            oy.float() / scale,
-            oz.float() / scale,
-        ], dim=-1)  # (N, 3)
-        return self.pos_proj(pos)  # (N, feature_dim)
+            ox.float() / scale, oy.float() / scale, oz.float() / scale,
+        ], dim=-1)
+        return self.pos_proj(pos)
+
+    def _run_mid_transformer(self, features, octree, depth, lvl):
+        """1-block OctFormer for same-level node communication."""
+        octreeT = OctreeT(
+            octree, features.shape[0], self.patch_size, self.dilation,
+            nempty=False, depth_list=[depth], buffer_size=0,
+            use_swin=self.use_swin)
+        feat = depth2batch(features, octreeT.indices)
+        feat = self.mid_transformers[lvl](feat, octreeT, context=None)
+        feat = batch2depth(feat, octreeT.indices)
+        return self.mid_norms[lvl](feat)
 
     def _run_leaf_transformer(self, features, octree, depth):
-        """Run the leaf-level OctFormer for feature refinement."""
         octreeT = OctreeT(
             octree, features.shape[0], self.patch_size, self.dilation,
             nempty=False, depth_list=[depth], buffer_size=0,
@@ -226,7 +271,6 @@ class FractalGenerator(nn.Module):
         return self.leaf_norm(feat)
 
     def _expand_features(self, features, split_mask, level_idx):
-        """Expand split parents into 8 children via local cross-attention."""
         parents = features[split_mask]
         n = parents.shape[0]
         if n == 0:
@@ -241,11 +285,10 @@ class FractalGenerator(nn.Module):
     # ------------------------------------------------------------------
 
     def forward(self, octree_gt, vqvae=None):
-        """Training forward pass with teacher forcing."""
         device = octree_gt.device
         output = {}
 
-        # ---- 1. Extract GT VQ targets from frozen VQ-VAE ----
+        # ---- 1. Extract GT VQ targets ----
         if vqvae is not None:
             with torch.no_grad():
                 vq_code = vqvae.extract_code(octree_gt)
@@ -253,7 +296,7 @@ class FractalGenerator(nn.Module):
         else:
             gt_indices = None
 
-        # ---- 2. Initialise features at full_depth WITH position encoding ----
+        # ---- 2. Init features with position encoding ----
         features = self.root_embedding.expand(
             octree_gt.nnum[self.full_depth], -1).contiguous()
         features = features + self._get_pos_embed(octree_gt, self.full_depth)
@@ -261,7 +304,7 @@ class FractalGenerator(nn.Module):
         total_split_loss = torch.tensor(0.0, device=device)
         total_split_acc = 0.0
 
-        # ---- 3. Fractal expansion: full_depth -> depth_stop-1 ----
+        # ---- 3. Fractal expansion ----
         for lvl in range(self.num_levels):
             d = self.full_depth + lvl
             nnum_d = octree_gt.nnum[d]
@@ -269,30 +312,31 @@ class FractalGenerator(nn.Module):
             assert features.shape[0] == nnum_d, \
                 f"Shape mismatch at depth {d}: features={features.shape[0]}, nnum={nnum_d}"
 
-            # Predict split (occupied / empty)
+            # Node communication: let neighbors talk before split decision
+            if features.shape[0] > 0:
+                features = self._run_mid_transformer(
+                    features, octree_gt, d, lvl)
+
+            # Predict split
             logits = self.split_heads[lvl](features)
             gt_split = (octree_gt.children[d] >= 0).long()
-            # 加权：惩罚漏分裂（false negative）比误分裂更严重
-            split_ce_weight = torch.tensor([1.0, 3.0], device=device)
-            total_split_loss = total_split_loss + F.cross_entropy(
-                logits, gt_split, weight=split_ce_weight)
+
+            # Focal Loss (handles class imbalance)
+            total_split_loss = total_split_loss + self.focal_loss(logits, gt_split)
 
             with torch.no_grad():
                 total_split_acc += (logits.argmax(-1) == gt_split).float().mean().item()
 
-            # Teacher Forcing: only expand occupied nodes
+            # Teacher Forcing
             split_mask = (gt_split == 1)
 
-            # Expand features for split children
+            # Expand + inject position at new depth
             child_features = self._expand_features(features, split_mask, lvl)
-
-            # Inject position encoding at the NEW depth level
             child_features = child_features + self._get_pos_embed(
                 octree_gt, d + 1)
-
             features = child_features
 
-        # ---- 4. Leaf-level transformer (depth_stop) ----
+        # ---- 4. Leaf-level transformer ----
         nnum_leaf = octree_gt.nnum[self.depth_stop]
         assert features.shape[0] == nnum_leaf, "Final leaf count mismatch!"
 
@@ -304,7 +348,7 @@ class FractalGenerator(nn.Module):
         output["split_accuracy"] = torch.tensor(
             total_split_acc / max(self.num_levels, 1), device=device)
 
-        # ---- 5. VQ token prediction loss ----
+        # ---- 5. VQ token prediction ----
         if gt_indices is not None and features.shape[0] > 0:
             vq_logits = self.vq_head(features)
             vq_logits_flat = vq_logits.reshape(-1, self.vq_size)
@@ -318,28 +362,21 @@ class FractalGenerator(nn.Module):
             output["vq_loss"] = torch.tensor(0.0, device=device)
             output["vq_accuracy"] = torch.tensor(0.0, device=device)
 
-        # Total loss
         output["loss"] = (self.split_weight * output["split_loss"]
                           + self.vq_weight * output["vq_loss"])
-
         return output
 
     # ------------------------------------------------------------------
-    # Generation (inference)
+    # Generation
     # ------------------------------------------------------------------
 
     @torch.no_grad()
     def generate(self, batch_size=1, device="cuda", temperature=0.8,
                  vqvae=None):
-        """Generate shapes by fractal expansion + VQ token sampling.
-
-        Split uses argmax (greedy) for structural stability.
-        VQ tokens use temperature sampling for diversity.
-        """
+        """Generate with threshold-based split and temperature VQ sampling."""
         octree = ocnn.octree.init_octree(
             self.depth_stop, self.full_depth, batch_size, device)
 
-        # Initialise features WITH position encoding
         features = self.root_embedding.expand(
             octree.nnum[self.full_depth], -1).contiguous()
         features = features + self._get_pos_embed(octree, self.full_depth)
@@ -347,10 +384,18 @@ class FractalGenerator(nn.Module):
         for lvl in range(self.num_levels):
             d = self.full_depth + lvl
 
+            # Node communication before split
+            if features.shape[0] > 0:
+                features = self._run_mid_transformer(
+                    features, octree, d, lvl)
+
             logits = self.split_heads[lvl](features)
 
-            # GREEDY for split: structure must be stable, no random pruning!
-            split = logits.argmax(-1)
+            # Threshold-based split: if P(split) > threshold, split it
+            # Much better than argmax (which collapses to all-0)
+            # and more stable than multinomial sampling
+            probs = F.softmax(logits, dim=-1)
+            split = (probs[:, 1] > self.split_threshold).long()
 
             # Grow octree
             octree.octree_split(split, d)
@@ -361,7 +406,7 @@ class FractalGenerator(nn.Module):
             if features.shape[0] == 0:
                 break
 
-            # Inject position encoding at new depth
+            # Position encoding at new depth
             features = features + self._get_pos_embed(octree, d + 1)
 
         # Leaf-level transformer
@@ -369,11 +414,10 @@ class FractalGenerator(nn.Module):
             features = self._run_leaf_transformer(
                 features, octree, self.depth_stop)
 
-        # Predict VQ tokens
+        # Predict VQ tokens with temperature sampling
         vq_logits = self.vq_head(features)
         vq_logits = vq_logits.reshape(-1, self.vq_groups, self.vq_size)
 
-        # Temperature sampling for VQ tokens (diversity in surface detail)
         if temperature > 0:
             probs = F.softmax(vq_logits / temperature, dim=-1)
             indices = torch.multinomial(
@@ -381,7 +425,6 @@ class FractalGenerator(nn.Module):
         else:
             indices = vq_logits.argmax(-1)
 
-        # Convert indices to quantized codes
         if vqvae is not None:
             vq_code = vqvae.quantizer.extract_code(indices)
         else:
