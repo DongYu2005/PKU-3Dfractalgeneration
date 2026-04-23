@@ -149,7 +149,7 @@ class FractalGenerator(nn.Module):
         focal_alpha: float = 0.75,
         focal_gamma: float = 2.0,
         # Generation threshold for split
-        split_threshold: float = 0.3,
+        split_threshold: float = 0.45,
         **kwargs,
     ):
         super().__init__()
