@@ -124,6 +124,8 @@ Solver 侧的常用参数（`SOLVER.*`）：`max_epoch`、`lr`、`rand_seed`、
 
 - **永远不要删 `logs/` 和 `saved_ckpt/` 下的文件**。一次训练要跑很久，
   obj 和 ckpt 都要保留作为对照，清理前先问我。
+- **Git commit 不要加 `Co-Authored-By: Claude` 等任何 Claude 署名行**。
+  正常写 commit message 即可，不要写 trailer。
 - 改 `fractal_generator.py` 的默认参数前先问：
   model 的默认值是 fallback，config 没覆盖到时才生效，容易踩坑。
 - 参数 sweep 之前，把完整网格列出来让我确认再启动，这些 run 不便宜。
