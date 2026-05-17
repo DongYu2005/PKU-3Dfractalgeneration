@@ -1,0 +1,14 @@
+# E5: replace focal loss with standard CE (建议 5)
+# Hypothesis: focal loss tuned for overfit; on im_5 maybe hurts because it
+# down-weights easy samples. Alone may be slightly negative (no mask focus).
+
+BASE:
+  - configs/shapenet_frac_im5.yaml
+
+SOLVER:
+  logdir: logs/exp/E5_ce_only
+  max_epoch: 20
+
+MODEL:
+  FractalGen:
+    use_focal_loss: False

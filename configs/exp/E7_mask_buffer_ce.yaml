@@ -1,0 +1,15 @@
+# E7: E6 + drop focal loss (paired with masked training to avoid signal dilution)
+
+BASE:
+  - configs/shapenet_frac_im5.yaml
+
+SOLVER:
+  logdir: logs/exp/E7_mask_buffer_ce
+  max_epoch: 20
+
+MODEL:
+  FractalGen:
+    use_masked_training: True
+    mask_ratio_min: 0.5
+    buffer_size: 32
+    use_focal_loss: False

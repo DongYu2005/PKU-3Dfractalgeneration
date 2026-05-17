@@ -1,0 +1,14 @@
+# E2: buffer tokens alone (建议 2)
+# Hypothesis: 32 always-visible global tokens propagate global context; expect
+# +0.03+ vs E0 baseline_new_metric.
+
+BASE:
+  - configs/shapenet_frac_im5.yaml
+
+SOLVER:
+  logdir: logs/exp/E2_buffer_only
+  max_epoch: 20
+
+MODEL:
+  FractalGen:
+    buffer_size: 32

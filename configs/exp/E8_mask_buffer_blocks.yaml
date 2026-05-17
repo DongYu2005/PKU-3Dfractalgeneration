@@ -1,0 +1,16 @@
+# E8: E6 + redistribute blocks (check whether capacity becomes new bottleneck
+# once mask + buffer have raised split_acc significantly)
+
+BASE:
+  - configs/shapenet_frac_im5.yaml
+
+SOLVER:
+  logdir: logs/exp/E8_mask_buffer_blocks
+  max_epoch: 20
+
+MODEL:
+  FractalGen:
+    use_masked_training: True
+    mask_ratio_min: 0.5
+    buffer_size: 32
+    mid_blocks_per_level: [4, 2, 1]

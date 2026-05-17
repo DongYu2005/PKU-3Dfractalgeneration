@@ -1,0 +1,17 @@
+# E9: all v5 improvements together (upper-bound validation)
+
+BASE:
+  - configs/shapenet_frac_im5.yaml
+
+SOLVER:
+  logdir: logs/exp/E9_full_stack
+  max_epoch: 20
+
+MODEL:
+  FractalGen:
+    use_masked_training: True
+    mask_ratio_min: 0.5
+    buffer_size: 32
+    mid_blocks_per_level: [4, 2, 1]
+    use_sibling_attn: True
+    use_focal_loss: False

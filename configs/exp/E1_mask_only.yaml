@@ -1,0 +1,15 @@
+# E1: masked training alone (建议 1)
+# Hypothesis: random feature masking is the single biggest fix; expect +0.08+
+# vs E0 baseline_new_metric.
+
+BASE:
+  - configs/shapenet_frac_im5.yaml
+
+SOLVER:
+  logdir: logs/exp/E1_mask_only
+  max_epoch: 20
+
+MODEL:
+  FractalGen:
+    use_masked_training: True
+    mask_ratio_min: 0.5
