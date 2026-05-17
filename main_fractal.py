@@ -178,7 +178,7 @@ class FractalSolver(Solver):
         self.load_checkpoint()
         self.model.eval()
 
-        num_meshes = self.FLAGS.get("num_generate", 100)
+        num_meshes = self.FLAGS.get("num_generate", 30)
         for i in tqdm(range(num_meshes), ncols=80):
             self.generate_step(i)
 
