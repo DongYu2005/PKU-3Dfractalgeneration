@@ -9,3 +9,8 @@ outputs/
 logs/
 octgpt/
 saved_ckpt/
+
+# v5 experiment artifacts (configs/git_sha kept, large logs/ckpts ignored)
+experiments/*/train.log
+experiments/*/requirements.txt
+experiments/*/gpu.txt
