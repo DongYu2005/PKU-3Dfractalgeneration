@@ -90,6 +90,7 @@ MODEL:
 
   # ---- Fractal Generator ----
   FractalGen:
+    # core architecture
     feature_dim: 384
     num_heads: 8
     blocks_per_level: 6
@@ -107,3 +108,19 @@ MODEL:
     vq_groups: 32
     vq_size: 2
     expander_num_heads: 4
+    # v4 hyperparameters (kept here so override configs can change them via merge)
+    focal_alpha: 0.75
+    focal_gamma: 2.0
+    split_threshold: 0.45
+    # v5 flag defaults (kept here for yacs strict-mode override compatibility;
+    # values below reproduce v4 baseline; experiment configs override these)
+    use_masked_training: False
+    mask_ratio_min: 0.5
+    buffer_size: 0
+    mid_blocks_per_level: [1, 1, 1]
+    use_sibling_attn: False
+    use_focal_loss: True
+    metric_mask_ratio: 0.7
+
+# top-level: number of meshes to generate (used by SOLVER.run=generate)
+num_generate: 30
