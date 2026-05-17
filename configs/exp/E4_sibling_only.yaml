@@ -1,0 +1,15 @@
+# E4: sibling self-attention in LocalCrossAttentionExpander (建议 4)
+# Hypothesis: 8 sibling children attend to each other; restores real
+# attention semantics (K=1 cross-attn degenerates to MLP). Primary effect
+# is mesh smoothness at octant boundaries; split_acc only +0.01~0.02.
+
+BASE:
+  - configs/shapenet_frac_im5.yaml
+
+SOLVER:
+  logdir: logs/exp/E4_sibling_only
+  max_epoch: 20
+
+MODEL:
+  FractalGen:
+    use_sibling_attn: True

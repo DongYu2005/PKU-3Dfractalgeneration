@@ -1,0 +1,14 @@
+# E3: per-level mid_transformer depth redistribution (建议 3)
+# Hypothesis: more capacity at coarse depths (FractalGen Table 1 philosophy);
+# expect +0.03+ vs E0 baseline_new_metric. Params ↑ ~8M (19.6M → 27.6M).
+
+BASE:
+  - configs/shapenet_frac_im5.yaml
+
+SOLVER:
+  logdir: logs/exp/E3_blocks_only
+  max_epoch: 20
+
+MODEL:
+  FractalGen:
+    mid_blocks_per_level: [4, 2, 1]

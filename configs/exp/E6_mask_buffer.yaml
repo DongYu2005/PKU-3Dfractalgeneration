@@ -1,0 +1,15 @@
+# E6: masked training + buffer tokens (combination, predicted best ROI)
+# Hypothesis: +0.13+ vs E0. Mask + buffer is the highest-leverage combo.
+
+BASE:
+  - configs/shapenet_frac_im5.yaml
+
+SOLVER:
+  logdir: logs/exp/E6_mask_buffer
+  max_epoch: 20
+
+MODEL:
+  FractalGen:
+    use_masked_training: True
+    mask_ratio_min: 0.5
+    buffer_size: 32

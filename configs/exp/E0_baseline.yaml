@@ -1,0 +1,11 @@
+# E0 baseline: v4 reference. No flag overrides; reports BOTH old
+# (split_accuracy_all) and new (split_accuracy = mask-only) metrics.
+# Single run covers both "E0 baseline_old_metric" and "E0' baseline_new_metric"
+# rows in RESULTS.md.
+
+BASE:
+  - configs/shapenet_frac_im5.yaml
+
+SOLVER:
+  logdir: logs/exp/E0_baseline
+  max_epoch: 20
