@@ -16,7 +16,7 @@ import copy
 
 # ---- path setup ----
 _ROOT = os.path.dirname(os.path.abspath(__file__))
-_OCTGPT = os.path.normpath(os.path.join(_ROOT, "..", "octgpt"))
+_OCTGPT = os.path.normpath(os.path.join(_ROOT, "octgpt"))
 sys.path.insert(0, _OCTGPT)
 sys.path.insert(0, _ROOT)
 

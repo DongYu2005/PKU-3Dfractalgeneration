@@ -1,12 +1,10 @@
 # 3D 分形生成项目
 
-<!-- 本文件覆盖并扩展全局 ~/.claude/CLAUDE.md。保持 200 行以内。
-     规则膨胀时拆分到 .claude/rules/ 目录做模块化管理。 -->
-
 ## 项目简介
 
-一个 3D 分形生长系统，通过迭代累积和一个控制局部密度的截断阈值来生成结构化形状。
-当前目标：稳定生成可辨识的目标形状（目前是飞机轮廓），同时避免表面过密。
+基于 OctGPT 的 3D 分形生成模型：用一个分形展开的 octree 生成器预测 split，
+再用冻结的 VQ-VAE 把叶子节点的 VQ token 解码成 SDF，最后 marching cubes 出 mesh。
+当前目标：在 ShapeNet 单个飞机上过拟合，验证整条 fractal + VQ-VAE pipeline。
 
 ## ⚠️ 环境（每次启动 CC 后先确认）
 
@@ -21,75 +19,113 @@ conda activate aibasis
 
 ## 仓库结构
 
-<!-- TODO：根据实际情况替换路径 -->
-
 ```
 .
-├── src/
-│   ├── growth/          # 分形生长核心算法
-│   ├── render/          # 3D 可视化（生成你看到的灰色渲染图）
-│   ├── config/          # 每个实验对应的 YAML config
-│   └── utils/
-├── scripts/
-│   ├── run_growth.py    # 生成任务的入口
-│   └── visualize.py     # 渲染已有的 mesh
+├── main_fractal.py                 # 训练/生成入口（VQ-VAE 版）
+├── render_obj.py                   # headless 渲染 .obj → 三视图 PNG
+├── fractal_models/
+│   └── fractal_generator.py        # FractalGenerator v4（focal loss + 阈值 split）
+├── without_VQVAE/                  # 不带 VQ-VAE 的对照实现
+│   ├── main_fractal_withoutVQVAE.py
+│   └── fractal_generator_withoutVQVAE.py
 ├── configs/
-│   └── airplane.yaml    # 当前工作 config
-└── outputs/             # 生成的 mesh 和渲染图（gitignored）
+│   ├── shapenet_fractal.yaml       # 当前主 config（overfit 单飞机）
+│   ├── shapenet_fractal_debug.yaml
+│   └── shapenet_frac.yaml
+├── saved_ckpt/                     # 冻结的 VQ-VAE 权重（gitignored）
+├── octgpt/                         # 外部依赖，作为 sibling 引入（gitignored）
+├── data/ShapeNet/                  # 数据（gitignored）
+└── logs/fractal/<run>/results/     # 生成的 .obj（按 epoch 命名，gitignored）
 ```
+
+注意：`octgpt/`、`data/`、`logs/`、`saved_ckpt/`、`*.obj`、`*.pth` 都在 .gitignore。
 
 ## 常用命令
 
 ```bash
-# 激活环境（先做这个）
 conda activate aibasis
 
-# 从 config 生成形状
-python scripts/run_growth.py --config configs/airplane.yaml
+# 训练（默认就会每 20 epoch 生成一次样本到 logs/.../results/）
+python main_fractal.py --config configs/shapenet_fractal.yaml
 
-# 渲染已有 mesh
-python scripts/visualize.py --mesh outputs/airplane_v3.obj
+# 生成（训练完后）
+python main_fractal.py --config configs/shapenet_fractal.yaml \
+    SOLVER.run generate SOLVER.ckpt <path_to_ckpt>
 
-# 快速迭代：生成 + 渲染一气呵成
-python scripts/run_growth.py --config configs/airplane.yaml --render
+# 不带 VQ-VAE 的对照
+python without_VQVAE/main_fractal_withoutVQVAE.py --config configs/shapenet_fractal.yaml
+
+# 快速渲染某个生成的 .obj 到三视图 PNG（headless，不需要 GUI）
+python render_obj.py logs/fractal/<run>/results/<epoch>.obj
 ```
 
-## 核心参数（我实际会调的几个）
+## 核心参数（我实际会调的）
 
-| 参数 | 作用 | 典型范围 | 备注 |
+定义在 `fractal_models/fractal_generator.py` 的 `FractalGenerator.__init__`，
+通过 config 里 `MODEL.FractalGen.*` 覆盖。
+
+| 参数 | 作用 | 典型值 | 备注 |
 |---|---|---|---|
-| `truncation_threshold` | 局部密度超过此值时截断生长 | 0.3–0.8 | **偏低会导致表面过密**，当前就是这个问题 |
-| `growth_rate` | 每步累积概率 | 0.05–0.3 | |
-| `max_iterations` | 生长步数上限 | 500–5000 | |
-| `seed_shape` | 初始几何形状 | `plane`、`sphere`、`custom` | |
+| `split_threshold` | 生成时 `P(split) > threshold` 才分裂 | 0.3–0.6 | **当前工作值 0.45**，更低会过密 |
+| `focal_alpha` | Focal Loss 正样本权重（split=1 很稀疏） | 0.75 | 处理 split 类别极度不均衡 |
+| `focal_gamma` | Focal Loss 难样本聚焦系数 | 2.0 | |
+| `temperature` | 生成时 VQ token 采样温度 | 0.8 | 0 则 argmax |
+| `depth_stop` | 分形展开停止深度（之后交给 VQ-VAE 解码） | 6 | 再由 zero split 扩到 `depth=8` |
+| `full_depth` | 分形起始深度（root 所在深度） | 3 | |
+| `feature_dim` | Transformer 隐藏维度 | 384 | |
+| `blocks_per_level` | 叶子层 OctFormerStage 的 block 数 | 6 | 每个中间层固定 1 block |
+| `split_weight` / `vq_weight` | 两路 loss 的权重 | 1.0 / 1.0 | |
+
+Solver 侧的常用参数（`SOLVER.*`）：`max_epoch`、`lr`、`rand_seed`、
+`resolution`（marching cubes 分辨率）、`sdf_scale`。
 
 ## 已知问题（Known issues）
 
-- **表面过密（当前）**：truncation_threshold 设得偏低（上次是 0.35）。飞机形状
-  已经正确长出来了，但表面覆盖了一层小凸起。下次试 `truncation_threshold: 0.55–0.65`。
-- `max_iterations > 3000` 跑飞机 config 会开始侵蚀机翼结构，要早点停。
-- renderer 存在 y-up / z-up 不一致，导出到 Blender 时部分 mesh 需要手动旋转。
+- **split 阈值偏低 → 表面过密**：0.3–0.4 附近飞机能长出来但叶子层太满；
+  0.45 现在看起来是 overfit 下的甜点区，再高（>0.5）之前没系统扫过。
+- **argmax 全崩**：纯 argmax 选 split 会因为 50% loss 截断直接输出空节点
+  （见 commit `26628fd`），所以生成路径目前是阈值分裂 + VQ 温度采样。
+- **VQ-VAE 权重路径**：`saved_ckpt/vqvae_large_im5_{cond,uncond}_bsq32.pth`
+  通过 config 的 `vqvae_ckpt` 字段指定，别忘了带路径。
+- **octgpt 是 sibling 依赖**：`main_fractal.py` 从 `../octgpt` 做 `sys.path.insert`，
+  移动仓库或改目录结构时要同步改。
 
-<!-- 每次 debug 完新问题就往这里加一条 -->
+## 当前状态（v4 / commit 27eb6dc）
+
+- `v1`：argmax 选 split → 输出空节点（commit 26628fd 的问题）
+- `v2`：阈值 split，能长出较完整飞机，但阈值偏低表面太密（commit b9c4c18）
+- `v3` → `v4`（当前）：`split_threshold=0.45`，在 overfit 单飞机 config 下
+  长出"还算比较好"的 obj（commit 27eb6dc），过拟合 pipeline 算走通了
+- 过拟合调参到此为止：`0.5` 试过，表面有空缺，`0.45` 仍是唯一可用工作点。
+  再调这个参数没有研究价值。
+- 200 epoch 已收敛，长训练不要再设 400。
+
+## 当前路线（2026-05-15 起）
+
+完整研究计划写在 `/home/batchcom/.claude/plans/wobbly-swimming-harp.md`。
+三阶段并行，**不要再回去调过拟合阈值**：
+
+- **Phase 1（基础设施）**：写 `eval/eval_fractal.py`（Chamfer/MMD-CD/COV/1-NNA）+
+  `eval/bench_speed.py`（推理速度对比）。复用 `octgpt/metrics/evaluation_metrics.py`。
+- **Phase 2（速度卖点 / Phase A）**：im_5 多类别泛化训练 Fractal + OctGPT baseline，
+  出主结果表对比 MMD/COV/1-NNA + 推理 s/sample。卖点是 Fractal 4 次 forward vs
+  OctGPT ~576 次 forward。
+- **Phase 3（端到端突破 / Phase B）**：先给 `without_VQVAE/` 补齐结构性差异
+  （加 mid_transformer + 每层位置编码），定位"端到端崩"的真正原因。
 
 ## 评测流程
 
-每次生成结束后产出这份报告：
-1. 三个规范角度的渲染图（正视、3/4 视角、俯视）
-2. 表面密度直方图
-3. 体积和 bounding box 尺寸 vs 目标
-4. 和上一次最佳结果的并排对比
-
-## 当前状态
-
-- `v1` / `v2`：飞机轮廓初步长出来（关键突破，形状可辨识）
-- `v3`（当前）：truncation_threshold 偏低导致表面过密
-- 下一步：固定 growth_rate 和 seed，在 `[0.45, 0.55, 0.65, 0.75]` 上扫
-  truncation_threshold，对比表面平滑度
+**量化**（主要）：`python eval/eval_fractal.py --gen_dir logs/<run>/results/ --ref_dir <gt>`
+出 MMD-CD / COV / 1-NNA 三个数 + per-sample CSV。
+**速度**：`python eval/bench_speed.py --ckpt <fractal_ckpt> --octgpt_ckpt <octgpt_ckpt>`。
+**目测**（辅助）：`render_obj.py` 渲三视图，看是否形状合理。
 
 ## 在这个项目里工作时
 
-- **永远不要删 `outputs/` 里的文件**。每次生成都很贵，需要清理先问我。
-- 做参数 sweep 之前，把完整网格列出来让我确认一下再启动，这些 run 不便宜。
-- 一次生成效果好的时候，立刻把 config、mesh、渲染图三件套一起存到
-  `outputs/snapshots/` 下并命名。
+- **永远不要删 `logs/` 和 `saved_ckpt/` 下的文件**。一次训练要跑很久，
+  obj 和 ckpt 都要保留作为对照，清理前先问我。
+- 改 `fractal_generator.py` 的默认参数前先问：
+  model 的默认值是 fallback，config 没覆盖到时才生效，容易踩坑。
+- 参数 sweep 之前，把完整网格列出来让我确认再启动，这些 run 不便宜。
+- 一次生成效果好的时候，把 config、ckpt、代表 obj 一起记下来（commit 里
+  或单独起文件夹都行），方便后面回退对照。
