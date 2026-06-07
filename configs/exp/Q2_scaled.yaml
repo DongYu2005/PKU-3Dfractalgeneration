@@ -1,0 +1,32 @@
+# Q2: scaled-up model (~163.5M, matching OctGPT's 170M) to improve single-pass
+# split structure -> fewer missing depth-6 nodes -> fewer surface holes, while
+# keeping ~4 forwards/sample (vs OctGPT's 576). Builds on V1's conditioning.
+# From scratch (dims changed, no warm-start). A masked variant can later warm-
+# start from this checkpoint (flag-gated, zero-init).
+
+BASE:
+  - configs/shapenet_frac_im5.yaml
+
+SOLVER:
+  logdir: logs/exp/Q2_scaled
+  max_epoch: 20
+
+DATA:
+  train:
+    filelist: data/ShapeNet/filelist/train_im_5_labeled.txt
+  test:
+    filelist: data/ShapeNet/filelist/test_im_5_labeled.txt
+
+MODEL:
+  FractalGen:
+    feature_dim: 768
+    num_heads: 8
+    mid_blocks_per_level: [3, 3, 3]
+    blocks_per_level: 12
+    use_class_cond: True
+    num_classes: 5
+    cond_every_level: True
+    use_latent: True
+    latent_dim: 256
+    kl_weight: 0.0001
+    split_sample: True
