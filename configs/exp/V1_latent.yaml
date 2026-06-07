@@ -1,0 +1,26 @@
+# V1: class-conditional + per-level injection + VAE latent z.
+# Encodes the GT shape (pooled frozen VQ-VAE code) into z, injected alongside
+# the class embedding. Captures intra-class variation (same class -> different
+# shapes) and raises the single-pass information ceiling. At generation z~N(0,I).
+
+BASE:
+  - configs/shapenet_frac_im5.yaml
+
+SOLVER:
+  logdir: logs/exp/V1_latent
+  max_epoch: 20
+
+DATA:
+  train:
+    filelist: data/ShapeNet/filelist/train_im_5_labeled.txt
+  test:
+    filelist: data/ShapeNet/filelist/test_im_5_labeled.txt
+
+MODEL:
+  FractalGen:
+    use_class_cond: True
+    num_classes: 5
+    cond_every_level: True
+    use_latent: True
+    latent_dim: 256
+    kl_weight: 0.0001

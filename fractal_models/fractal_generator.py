@@ -17,12 +17,11 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import scipy.stats as stats
 
 from torch.nn import LayerNorm
 
 _octgpt_path = os.path.normpath(
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'octgpt'))
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'octgpt'))
 if _octgpt_path not in sys.path:
     sys.path.insert(0, _octgpt_path)
 
@@ -180,6 +179,35 @@ class FractalGenerator(nn.Module):
         #         baselines can still report a mask-only number comparable to
         #         OctGPT's metric)
         metric_mask_ratio: float = 0.7,
+        # class-conditional generation: inject a per-class embedding at the root
+        # so the model can distinguish shapes instead of learning the marginal
+        # split distribution. Zero-initialised so a warm-started baseline ckpt
+        # starts out exactly equivalent to the unconditional model.
+        use_class_cond: bool = False,
+        num_classes: int = 5,
+        # re-inject the class embedding at every expansion level (not just root)
+        # so the conditioning signal does not dilute by the time it reaches the
+        # fine levels, where split accuracy is lowest.
+        cond_every_level: bool = False,
+        # at generation, sample split ~ Bernoulli(p) instead of thresholding
+        # p > split_threshold. Adds diversity and avoids a whole branch dying
+        # when p sits just below the threshold (the "chair collapse").
+        split_sample: bool = False,
+        # VAE-style latent: encode the GT shape (pooled frozen VQ-VAE code) into
+        # z, inject at the root. Captures intra-class variation and raises the
+        # information ceiling. At generation z ~ N(0, I). z_proj is zero-init so
+        # a warm-started baseline starts equivalent (latent ignored initially).
+        use_latent: bool = False,
+        latent_dim: int = 256,
+        vq_code_dim: int = 32,
+        kl_weight: float = 1e-4,
+        # leaf VQ MaskGIT: train the leaf VQ head to predict masked tokens from
+        # visible-token context (vq_proj embeds known tokens), so at generation
+        # the surface tokens can be refined over a few iterative reveal steps
+        # (OctGPT-style, but only at the leaf and only leaf_vq_iters steps).
+        leaf_vq_mask: bool = False,
+        leaf_vq_iters: int = 1,
+        leaf_vq_temp: float = 1.0,
         **kwargs,
     ):
         super().__init__()
@@ -223,16 +251,39 @@ class FractalGenerator(nn.Module):
         self.root_embedding = nn.Parameter(torch.zeros(1, feature_dim))
         nn.init.normal_(self.root_embedding, std=0.02)
 
+        # ---- class-conditional root injection ----
+        self.use_class_cond = use_class_cond
+        self.num_classes = num_classes
+        self.cond_every_level = cond_every_level
+        self.split_sample = split_sample
+        if self.use_class_cond:
+            self.class_embedding = nn.Embedding(num_classes, feature_dim)
+            # zeroed after self.apply(self._init_weights) below
+
+        # ---- VAE latent: encode pooled GT VQ code -> z, inject at root ----
+        self.use_latent = use_latent
+        self.latent_dim = latent_dim
+        self.kl_weight = kl_weight
+        if self.use_latent:
+            self.z_mu = nn.Linear(vq_code_dim, latent_dim)
+            self.z_logvar = nn.Linear(vq_code_dim, latent_dim)
+            # z_proj zeroed after init so warm-start ignores z initially
+            self.z_proj = nn.Linear(latent_dim, feature_dim)
+
+        # ---- leaf VQ MaskGIT ----
+        self.leaf_vq_mask = leaf_vq_mask
+        self.leaf_vq_iters = leaf_vq_iters
+        self.leaf_vq_temp = leaf_vq_temp
+        if self.leaf_vq_mask:
+            self.leaf_vq_mask_emb = nn.Parameter(torch.zeros(1, feature_dim))
+
         # ---- spatial position projection ----
         self.pos_proj = nn.Linear(3, feature_dim)
 
-        # ---- masked-training: learnable mask token + ratio sampler ----
+        # ---- masked-training: learnable mask token ----
         if self.use_masked_training:
             self.mask_emb = nn.Parameter(torch.zeros(1, feature_dim))
             nn.init.normal_(self.mask_emb, std=0.02)
-            self.mask_ratio_generator = stats.truncnorm(
-                (self.mask_ratio_min - 1.0) / 0.25, 0.0,
-                loc=1.0, scale=0.25)
 
         # ---- buffer tokens (always-visible global context channel) ----
         if self.buffer_size > 0:
@@ -287,6 +338,23 @@ class FractalGenerator(nn.Module):
         self.vq_proj = nn.Linear(vq_groups, feature_dim)
 
         self.apply(self._init_weights)
+
+        # zero-init class embedding (adaLN-zero style): a warm-started baseline
+        # ckpt then starts byte-for-byte equivalent to the unconditional model,
+        # and the conditioning signal is learned from there.
+        if self.use_class_cond:
+            nn.init.zeros_(self.class_embedding.weight)
+        # zero-init z_proj so latent injection starts as a no-op (warm-start
+        # equivalence); the model learns to use z as KL anneals it in.
+        if self.use_latent:
+            nn.init.zeros_(self.z_proj.weight)
+            nn.init.zeros_(self.z_proj.bias)
+        # zero token-embedding path so leaf starts equivalent to one-shot vq_head
+        # (visible tokens contribute nothing at init; learned via attention grad)
+        if self.leaf_vq_mask:
+            nn.init.zeros_(self.leaf_vq_mask_emb)
+            nn.init.zeros_(self.vq_proj.weight)
+            nn.init.zeros_(self.vq_proj.bias)
 
     @staticmethod
     def _init_weights(module):
@@ -350,6 +418,58 @@ class FractalGenerator(nn.Module):
         feat = batch2depth(feat, octreeT.indices)
         return self.leaf_norm(feat)
 
+    def _leaf_vq_train(self, features, octree, gt_indices):
+        """MaskGIT leaf training: hide a random subset of nodes' VQ tokens,
+        feed visible tokens (via vq_proj) as context, predict the masked ones.
+        Returns (vq_logits [N,G,size], vq_mask [N] bool over hidden nodes)."""
+        n = features.shape[0]
+        ratio = float(torch.empty(1).uniform_(0.1, 1.0).item())
+        k = max(1, int(n * ratio))
+        perm = torch.randperm(n, device=features.device)
+        vq_mask = torch.zeros(n, dtype=torch.bool, device=features.device)
+        vq_mask[perm[:k]] = True
+        tok = self.vq_proj(gt_indices.float())
+        leaf_in = features + torch.where(
+            vq_mask.unsqueeze(1), self.leaf_vq_mask_emb.expand(n, -1), tok)
+        feat = self._run_leaf_transformer(leaf_in, octree, self.depth_stop)
+        logits = self.vq_head(feat).reshape(n, self.vq_groups, self.vq_size)
+        return logits, vq_mask
+
+    @torch.no_grad()
+    def _leaf_vq_generate(self, features, octree, temperature):
+        """Iterative MaskGIT decode of leaf VQ tokens (leaf_vq_iters steps,
+        cosine reveal schedule, confidence-based). Returns indices [N,G]."""
+        import math
+        n = features.shape[0]
+        device = features.device
+        iters = max(1, self.leaf_vq_iters)
+        t = temperature if temperature > 0 else self.leaf_vq_temp
+        indices = torch.zeros(n, self.vq_groups, dtype=torch.long, device=device)
+        known = torch.zeros(n, dtype=torch.bool, device=device)
+        samp = indices
+        for i in range(iters):
+            tok = self.vq_proj(indices.float())
+            leaf_in = features + torch.where(
+                known.unsqueeze(1), tok, self.leaf_vq_mask_emb.expand(n, -1))
+            feat = self._run_leaf_transformer(leaf_in, octree, self.depth_stop)
+            logits = self.vq_head(feat).reshape(n, self.vq_groups, self.vq_size)
+            probs = F.softmax(logits / max(t, 1e-6), dim=-1)
+            samp = torch.multinomial(
+                probs.reshape(-1, self.vq_size), 1).reshape(n, self.vq_groups)
+            conf = probs.gather(-1, samp.unsqueeze(-1)).squeeze(-1).mean(dim=1)
+            target = n if i == iters - 1 else int(
+                round(n * (1.0 - math.cos(math.pi / 2 * (i + 1) / iters))))
+            newly = target - int(known.sum().item())
+            if newly > 0:
+                conf_avail = conf.masked_fill(known, -1.0)
+                avail = int((~known).sum().item())
+                topk = torch.topk(conf_avail, min(newly, avail)).indices
+                indices[topk] = samp[topk]
+                known[topk] = True
+        if not bool(known.all()):
+            indices[~known] = samp[~known]
+        return indices
+
     def _expand_features(self, features, split_mask, level_idx):
         parents = features[split_mask]
         n = parents.shape[0]
@@ -370,7 +490,10 @@ class FractalGenerator(nn.Module):
         if n == 0:
             return torch.zeros(0, dtype=torch.bool, device=device)
         if self.use_masked_training:
-            mask_ratio = float(self.mask_ratio_generator.rvs(1)[0])
+            # Truncated normal in [mask_ratio_min, 1.0], mean=1.0, std=0.25.
+            # Uses torch RNG so DDP rank seeding and manual_seed apply.
+            raw = torch.empty(1).normal_(mean=1.0, std=0.25)
+            mask_ratio = float(raw.clamp(self.mask_ratio_min, 1.0).item())
         else:
             mask_ratio = self.metric_mask_ratio
         num_masked = max(1, int(n * mask_ratio))
@@ -383,7 +506,41 @@ class FractalGenerator(nn.Module):
     # Training forward
     # ------------------------------------------------------------------
 
-    def forward(self, octree_gt, vqvae=None):
+    def _inject_cond(self, features, octree, depth, label, z=None):
+        """Add per-class embedding and/or latent z to each node, gathered by
+        batch id. No-op for whichever conditioning is off, so the unconditional
+        path is byte-for-byte unchanged."""
+        bid = None
+        if self.use_class_cond and label is not None:
+            bid = octree.batch_id(depth, nempty=False).long()
+            features = features + self.class_embedding(label[bid])
+        if self.use_latent and z is not None:
+            if bid is None:
+                bid = octree.batch_id(depth, nempty=False).long()
+            features = features + self.z_proj(z)[bid]
+        return features
+
+    def _encode_latent(self, vq_code, octree, batch_size):
+        """Encode pooled GT VQ code into a latent z (VAE posterior) + KL.
+
+        Mean-pools the frozen VQ-VAE leaf code per sample, then maps to
+        (mu, logvar) and reparameterises. Returns (z, kl_loss)."""
+        bid = octree.batch_id(self.depth_stop, nempty=False).long()
+        dim = vq_code.shape[1]
+        pooled = torch.zeros(batch_size, dim, device=vq_code.device,
+                             dtype=vq_code.dtype)
+        pooled.index_add_(0, bid, vq_code)
+        counts = torch.zeros(batch_size, device=vq_code.device,
+                             dtype=vq_code.dtype)
+        counts.index_add_(0, bid, torch.ones_like(bid, dtype=vq_code.dtype))
+        pooled = pooled / counts.clamp(min=1).unsqueeze(1)
+        mu = self.z_mu(pooled)
+        logvar = self.z_logvar(pooled)
+        z = mu + (0.5 * logvar).exp() * torch.randn_like(mu)
+        kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+        return z, kl
+
+    def forward(self, octree_gt, vqvae=None, label=None):
         device = octree_gt.device
         output = {}
 
@@ -395,10 +552,19 @@ class FractalGenerator(nn.Module):
         else:
             gt_indices = None
 
+        # ---- 1b. Encode latent z from GT (VAE posterior) ----
+        z = None
+        kl_loss = torch.tensor(0.0, device=device)
+        if self.use_latent and vqvae is not None:
+            z, kl_loss = self._encode_latent(
+                vq_code, octree_gt, octree_gt.batch_size)
+
         # ---- 2. Init features with position encoding ----
         features = self.root_embedding.expand(
             octree_gt.nnum[self.full_depth], -1).contiguous()
         features = features + self._get_pos_embed(octree_gt, self.full_depth)
+        features = self._inject_cond(
+            features, octree_gt, self.full_depth, label, z)
 
         total_split_loss = torch.tensor(0.0, device=device)
         per_level_acc_mask = []  # mask-only accuracy (new primary metric)
@@ -417,36 +583,42 @@ class FractalGenerator(nn.Module):
             # when use_masked_training is on)
             mask = self._sample_mask(n, device, force_full=not self.training)
 
-            # Apply mask to features only when training with masking
             apply_mask = (self.use_masked_training and self.training and n > 0)
+
             if apply_mask:
-                features_for_pred = torch.where(
+                # Masked path: mask BEFORE mid_transformer so the transformer
+                # learns to infer masked nodes from context (BERT-style).
+                # Keep a clean copy for expansion (matches generate() flow).
+                features_clean = features
+                features_masked = torch.where(
                     mask.unsqueeze(1),
                     self.mask_emb.expand(n, -1),
                     features,
                 )
+                if n > 0:
+                    features_masked = self._run_mid_transformer(
+                        features_masked, octree_gt, d, lvl)
+                    features_clean = self._run_mid_transformer(
+                        features_clean, octree_gt, d, lvl)
+                features_for_pred = features_masked
+                features = features_clean
             else:
+                # Unmasked path (v4 behavior): single mid_transformer pass
+                if n > 0:
+                    features = self._run_mid_transformer(
+                        features, octree_gt, d, lvl)
                 features_for_pred = features
-
-            # Node communication (mid_transformer)
-            if n > 0:
-                features_for_pred = self._run_mid_transformer(
-                    features_for_pred, octree_gt, d, lvl)
-
-            # When NOT masking, propagate mid_transformer output to `features`
-            # so expansion benefits (v4 behavior). When masking, keep raw
-            # features for expansion to avoid propagating mask-derived state.
-            if not apply_mask:
-                features = features_for_pred
 
             # Predict split
             logits = self.split_heads[lvl](features_for_pred)
             gt_split = (octree_gt.children[d] >= 0).long()
 
-            # Loss
+            # Loss (respects use_focal_loss in all branches)
             if apply_mask and mask.any():
-                # standard CE on masked positions only
-                loss_lvl = F.cross_entropy(logits[mask], gt_split[mask])
+                if self.use_focal_loss:
+                    loss_lvl = self.focal_loss(logits[mask], gt_split[mask])
+                else:
+                    loss_lvl = F.cross_entropy(logits[mask], gt_split[mask])
             elif self.use_focal_loss:
                 loss_lvl = self.focal_loss(logits, gt_split)
             else:
@@ -475,15 +647,28 @@ class FractalGenerator(nn.Module):
             child_features = self._expand_features(features, split_mask_gt, lvl)
             child_features = child_features + self._get_pos_embed(
                 octree_gt, d + 1)
+            if self.cond_every_level:
+                child_features = self._inject_cond(
+                    child_features, octree_gt, d + 1, label, z)
             features = child_features
 
-        # ---- 4. Leaf-level transformer ----
+        # ---- 4. Leaf transformer + VQ token prediction ----
         nnum_leaf = octree_gt.nnum[self.depth_stop]
         assert features.shape[0] == nnum_leaf, "Final leaf count mismatch!"
 
-        if features.shape[0] > 0:
-            features = self._run_leaf_transformer(
+        has_leaf = features.shape[0] > 0
+        vq_mask = None
+        if has_leaf and gt_indices is not None and \
+                self.leaf_vq_mask and self.training:
+            vq_logits, vq_mask = self._leaf_vq_train(
+                features, octree_gt, gt_indices)
+        elif has_leaf:
+            leaf_feat = self._run_leaf_transformer(
                 features, octree_gt, self.depth_stop)
+            vq_logits = self.vq_head(leaf_feat).reshape(
+                -1, self.vq_groups, self.vq_size)
+        else:
+            vq_logits = None
 
         output["split_loss"] = total_split_loss / max(self.num_levels, 1)
         output["split_accuracy"] = (
@@ -495,22 +680,27 @@ class FractalGenerator(nn.Module):
             if per_level_acc_all else torch.tensor(0.0, device=device)
         )
 
-        # ---- 5. VQ token prediction ----
-        if gt_indices is not None and features.shape[0] > 0:
-            vq_logits = self.vq_head(features)
-            vq_logits_flat = vq_logits.reshape(-1, self.vq_size)
-            gt_flat = gt_indices.reshape(-1).long()
-            output["vq_loss"] = F.cross_entropy(vq_logits_flat, gt_flat)
-
+        # ---- 5. VQ loss (mask-only when leaf MaskGIT is on) ----
+        if vq_logits is not None and gt_indices is not None:
+            if vq_mask is not None and vq_mask.any():
+                logit_sel = vq_logits[vq_mask].reshape(-1, self.vq_size)
+                gt_sel = gt_indices[vq_mask].reshape(-1).long()
+            else:
+                logit_sel = vq_logits.reshape(-1, self.vq_size)
+                gt_sel = gt_indices.reshape(-1).long()
+            output["vq_loss"] = F.cross_entropy(logit_sel, gt_sel)
             with torch.no_grad():
-                pred_flat = vq_logits_flat.argmax(-1)
-                output["vq_accuracy"] = (pred_flat == gt_flat).float().mean()
+                output["vq_accuracy"] = (
+                    logit_sel.argmax(-1) == gt_sel).float().mean()
         else:
             output["vq_loss"] = torch.tensor(0.0, device=device)
             output["vq_accuracy"] = torch.tensor(0.0, device=device)
 
         output["loss"] = (self.split_weight * output["split_loss"]
                           + self.vq_weight * output["vq_loss"])
+        if self.use_latent:
+            output["kl_loss"] = kl_loss
+            output["loss"] = output["loss"] + self.kl_weight * kl_loss
         return output
 
     # ------------------------------------------------------------------
@@ -519,7 +709,7 @@ class FractalGenerator(nn.Module):
 
     @torch.no_grad()
     def generate(self, batch_size=1, device="cuda", temperature=0.8,
-                 vqvae=None):
+                 vqvae=None, label=None):
         """Generate with threshold-based split and temperature VQ sampling.
 
         Inference path: NO masking applied (mask_emb never touches features).
@@ -528,9 +718,16 @@ class FractalGenerator(nn.Module):
         octree = ocnn.octree.init_octree(
             self.depth_stop, self.full_depth, batch_size, device)
 
+        # latent prior sample (no GT at generation)
+        z = None
+        if self.use_latent:
+            z = torch.randn(batch_size, self.latent_dim, device=device)
+
         features = self.root_embedding.expand(
             octree.nnum[self.full_depth], -1).contiguous()
         features = features + self._get_pos_embed(octree, self.full_depth)
+        features = self._inject_cond(
+            features, octree, self.full_depth, label, z)
 
         for lvl in range(self.num_levels):
             d = self.full_depth + lvl
@@ -541,7 +738,10 @@ class FractalGenerator(nn.Module):
 
             logits = self.split_heads[lvl](features)
             probs = F.softmax(logits, dim=-1)
-            split = (probs[:, 1] > self.split_threshold).long()
+            if self.split_sample:
+                split = torch.bernoulli(probs[:, 1]).long()
+            else:
+                split = (probs[:, 1] > self.split_threshold).long()
 
             octree.octree_split(split, d)
             octree.octree_grow(d + 1)
@@ -551,20 +751,26 @@ class FractalGenerator(nn.Module):
                 break
 
             features = features + self._get_pos_embed(octree, d + 1)
+            if self.cond_every_level:
+                features = self._inject_cond(features, octree, d + 1, label, z)
 
-        if features.shape[0] > 0:
+        if features.shape[0] > 0 and self.leaf_vq_mask:
+            indices = self._leaf_vq_generate(features, octree, temperature)
+        elif features.shape[0] > 0:
             features = self._run_leaf_transformer(
                 features, octree, self.depth_stop)
-
-        vq_logits = self.vq_head(features)
-        vq_logits = vq_logits.reshape(-1, self.vq_groups, self.vq_size)
-
-        if temperature > 0:
-            probs = F.softmax(vq_logits / temperature, dim=-1)
-            indices = torch.multinomial(
-                probs.reshape(-1, self.vq_size), 1).reshape(-1, self.vq_groups)
+            vq_logits = self.vq_head(features)
+            vq_logits = vq_logits.reshape(-1, self.vq_groups, self.vq_size)
+            if temperature > 0:
+                probs = F.softmax(vq_logits / temperature, dim=-1)
+                indices = torch.multinomial(
+                    probs.reshape(-1, self.vq_size), 1).reshape(
+                        -1, self.vq_groups)
+            else:
+                indices = vq_logits.argmax(-1)
         else:
-            indices = vq_logits.argmax(-1)
+            indices = torch.zeros(
+                0, self.vq_groups, dtype=torch.long, device=device)
 
         if vqvae is not None:
             vq_code = vqvae.quantizer.extract_code(indices)

@@ -1,0 +1,23 @@
+# C2: class-conditional + per-level condition injection.
+# Re-injects the class embedding at every expansion level (not just root) so the
+# conditioning signal reaches the fine levels (lvl2/leaf) where split accuracy is
+# lowest. Same params as C1 (reuses class_embedding), warm-startable from E0.
+
+BASE:
+  - configs/shapenet_frac_im5.yaml
+
+SOLVER:
+  logdir: logs/exp/C2_cond_everylevel
+  max_epoch: 20
+
+DATA:
+  train:
+    filelist: data/ShapeNet/filelist/train_im_5_labeled.txt
+  test:
+    filelist: data/ShapeNet/filelist/test_im_5_labeled.txt
+
+MODEL:
+  FractalGen:
+    use_class_cond: True
+    num_classes: 5
+    cond_every_level: True

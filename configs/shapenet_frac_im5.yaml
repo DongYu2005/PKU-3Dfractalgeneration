@@ -121,6 +121,21 @@ MODEL:
     use_sibling_attn: False
     use_focal_loss: True
     metric_mask_ratio: 0.7
+    # class-conditional generation (off by default = unconditional baseline)
+    use_class_cond: False
+    num_classes: 5
+    # re-inject condition every level (vs root only); sample split vs threshold
+    cond_every_level: False
+    split_sample: False
+    # VAE latent (off by default): encode pooled GT VQ code -> z, inject at root
+    use_latent: False
+    latent_dim: 256
+    vq_code_dim: 32
+    kl_weight: 0.0001
+    # leaf VQ MaskGIT (surface detail): off by default
+    leaf_vq_mask: False
+    leaf_vq_iters: 1
+    leaf_vq_temp: 1.0
 
 # top-level: number of meshes to generate (used by SOLVER.run=generate)
 num_generate: 30

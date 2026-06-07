@@ -1,0 +1,31 @@
+# S1 (Q1 surface detail): V1 + leaf VQ MaskGIT.
+# Trains the leaf VQ head to predict masked tokens from visible-token context,
+# so at generation the surface tokens are refined over a few iterative reveal
+# steps (leaf_vq_iters), OctGPT-style but ONLY at the leaf. Structure (split)
+# stays single-pass. Targets the vq_accuracy ~0.63 bottleneck behind poor
+# surface detail. Warm-started from V1.
+
+BASE:
+  - configs/shapenet_frac_im5.yaml
+
+SOLVER:
+  logdir: logs/exp/S1_leaf_maskgit
+  max_epoch: 20
+
+DATA:
+  train:
+    filelist: data/ShapeNet/filelist/train_im_5_labeled.txt
+  test:
+    filelist: data/ShapeNet/filelist/test_im_5_labeled.txt
+
+MODEL:
+  FractalGen:
+    use_class_cond: True
+    num_classes: 5
+    cond_every_level: True
+    use_latent: True
+    latent_dim: 256
+    kl_weight: 0.0001
+    leaf_vq_mask: True
+    leaf_vq_iters: 4
+    leaf_vq_temp: 1.0

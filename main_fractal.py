@@ -13,6 +13,7 @@ Usage:
 import os
 import sys
 import copy
+import logging
 
 # ---- path setup ----
 _ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -74,7 +75,7 @@ class FractalSolver(Solver):
     # ------------------------------------------------------------------
 
     def batch_to_cuda(self, batch):
-        for key in ["octree", "octree_in", "octree_gt",
+        for key in ["octree", "octree_in", "octree_gt", "label",
                      "pos", "sdf", "grad", "weight", "occu", "color"]:
             if key in batch:
                 batch[key] = batch[key].cuda()
@@ -84,6 +85,7 @@ class FractalSolver(Solver):
         output = self.model(
             octree_gt=batch["octree_gt"],
             vqvae=self.vqvae_module,
+            label=batch.get("label"),
         )
         return output
 
@@ -95,16 +97,83 @@ class FractalSolver(Solver):
         output = self.model_forward(batch)
         return {"train/" + k: v for k, v in output.items()}
 
+    def train_epoch(self, epoch):
+        from thsolver.tracker import AverageTracker
+        self.model.train()
+        if self.world_size > 1:
+            self.train_loader.sampler.set_epoch(epoch)
+
+        flags = self.FLAGS.SOLVER
+        avg_tracker = AverageTracker()
+        rng = range(len(self.train_loader))
+        oom_count = 0
+        for it in tqdm(rng, ncols=80, leave=False, disable=self.disable_tqdm):
+            if flags.empty_cache > 0 and it % flags.empty_cache == 0:
+                torch.cuda.empty_cache()
+
+            batch = next(self.train_iter)
+            batch['iter_num'] = it
+            batch['epoch'] = epoch
+
+            self.optimizer.zero_grad(flags.zero_grad_to_none)
+            try:
+                with torch.autocast('cuda', enabled=self.use_amp):
+                    output = self.train_step(batch)
+                    loss = output['train/loss']
+
+                clip_grad = flags.clip_grad
+                if self.use_amp:
+                    self.scaler.scale(loss).backward()
+                    if clip_grad > 0:
+                        self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(), clip_grad)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    loss.backward()
+                    if clip_grad > 0:
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(), clip_grad)
+                    self.optimizer.step()
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                self.optimizer.zero_grad(set_to_none=True)
+                oom_count += 1
+                logging.warning(
+                    "OOM at epoch %d iter %d (total OOM: %d), skipping batch",
+                    epoch, it, oom_count)
+                continue
+
+            avg_tracker.update(output)
+            avg_tracker.record_time()
+
+            log_per_iter = flags.log_per_iter
+            if self.is_master and log_per_iter > 0 and it % log_per_iter == 0:
+                notes = 'iter: %d' % it
+                avg_tracker.log(epoch, msg_tag='- ', notes=notes,
+                                print_time=False)
+
+        if self.world_size > 1:
+            avg_tracker.average_all_gather()
+        if self.is_master:
+            avg_tracker.log(epoch, self.summary_writer, print_time=True)
+            if oom_count > 0:
+                logging.info("Epoch %d: %d OOM batches skipped", epoch,
+                             oom_count)
+
     def test_step(self, batch):
         with torch.no_grad():
             output = self.model_forward(batch)
         return {"test/" + k: v for k, v in output.items()}
 
     def test_epoch(self, epoch):
-        if epoch % 20 != 0:
-            return
+        # Called by the solver only at test_every_epoch boundaries. Generate a
+        # sample set every 10 epochs (generation writes big .obj files; keep it
+        # rarer than testing/checkpointing to save disk on the shared FS).
+        gen_every = self.FLAGS.SOLVER.get("gen_every_epoch", 10)
         super().test_epoch(epoch)
-        if self.is_master:
+        if self.is_master and (gen_every <= 0 or epoch % gen_every == 0):
             self.generate_step(epoch)
 
     # ------------------------------------------------------------------
@@ -112,27 +181,15 @@ class FractalSolver(Solver):
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def generate_step(self, index):
-        """Generate one shape using fractal expansion + VQ-VAE decoding.
-
-        Pipeline:
-        1. FractalGenerator produces octree structure + VQ codes at depth_stop
-        2. Extend octree from depth_stop to full depth (depth 8) with zero splits
-        3. VQ-VAE decoder reconstructs SDF from codes
-        4. Marching cubes extracts mesh
-        """
-        model = self.model_module
-        vqvae = self.vqvae_module
-        model.eval()
-
-        with torch.autocast("cuda", enabled=self.use_amp):
-            octree, vq_code = model.generate(
-                batch_size=1, device=self.device,
-                temperature=0.8, vqvae=vqvae)
-
-        print(f"Generated octree with {octree.nnum} nodes and VQ code shape {vq_code.shape}")
+    def _decode_and_save(self, octree, vq_code, mesh_path):
+        """Extend octree to full depth, VQ-VAE decode, marching cubes to obj."""
         if vq_code.shape[0] == 0:
+            print(f"Empty octree, skipping {mesh_path}")
             return
+        # alignment sanity: one code per depth_stop leaf, code dim = VQ embed dim
+        assert vq_code.shape[0] == octree.nnum[self.depth_stop], (
+            f"vq_code rows {vq_code.shape[0]} != depth_stop leaves "
+            f"{octree.nnum[self.depth_stop]}")
 
         # ---- Extend octree from depth_stop to full depth ----
         # The VQ-VAE decoder expects an octree at full depth.
@@ -146,15 +203,11 @@ class FractalSolver(Solver):
         # ---- Decode with VQ-VAE ----
         doctree = OctreeD(octree)
         code_depth = self.depth_stop
-        output = vqvae.decode_code(
+        output = self.vqvae_module.decode_code(
             vq_code, code_depth, doctree,
             copy.deepcopy(doctree), update_octree=True)
 
         # ---- Extract mesh via marching cubes ----
-        save_dir = os.path.join(self.logdir, "results")
-        os.makedirs(save_dir, exist_ok=True)
-        mesh_path = os.path.join(save_dir, f"{index}.obj")
-
         utils.create_mesh(
             output['neural_mpu'],
             mesh_path,
@@ -165,6 +218,40 @@ class FractalSolver(Solver):
             bbmax=self.FLAGS.SOLVER.sdf_scale,
             mesh_scale=self.FLAGS.DATA.test.points_scale,
             save_sdf=False)
+
+    @torch.no_grad()
+    def generate_step(self, index):
+        """Generate shapes using fractal expansion + VQ-VAE decoding.
+
+        Unconditional: one shape -> ``{index}.obj``.
+        Class-conditional: one shape per class -> ``{index}_cls{c}.obj``, so the
+        per-class diversity is directly visible in the output dir."""
+        model = self.model_module
+        vqvae = self.vqvae_module
+        model.eval()
+        save_dir = os.path.join(self.logdir, "results")
+        os.makedirs(save_dir, exist_ok=True)
+
+        if getattr(model, "use_class_cond", False):
+            for c in range(model.num_classes):
+                label = torch.full((1,), c, dtype=torch.long,
+                                   device=self.device)
+                with torch.autocast("cuda", enabled=self.use_amp):
+                    octree, vq_code = model.generate(
+                        batch_size=1, device=self.device,
+                        temperature=0.8, vqvae=vqvae, label=label)
+                print(f"[cls {c}] octree {octree.nnum} vq_code {vq_code.shape}")
+                self._decode_and_save(
+                    octree, vq_code,
+                    os.path.join(save_dir, f"{index}_cls{c}.obj"))
+        else:
+            with torch.autocast("cuda", enabled=self.use_amp):
+                octree, vq_code = model.generate(
+                    batch_size=1, device=self.device,
+                    temperature=0.8, vqvae=vqvae)
+            print(f"Generated octree {octree.nnum} vq_code {vq_code.shape}")
+            self._decode_and_save(
+                octree, vq_code, os.path.join(save_dir, f"{index}.obj"))
 
     # ------------------------------------------------------------------
     # Bulk generation entry-point

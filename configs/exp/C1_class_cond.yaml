@@ -1,0 +1,24 @@
+# C1: class-conditional generation. Inject a per-class embedding at the root so
+# the model can distinguish the 5 im_5 categories instead of collapsing to the
+# marginal split distribution. Diagnoses whether the "objs all look the same /
+# acc plateaus at ~0.79" problem is caused by the missing conditioning signal.
+#
+# Uses the *_labeled.txt filelists (2nd column = synset class index 0-4).
+
+BASE:
+  - configs/shapenet_frac_im5.yaml
+
+SOLVER:
+  logdir: logs/exp/C1_class_cond
+  max_epoch: 20
+
+DATA:
+  train:
+    filelist: data/ShapeNet/filelist/train_im_5_labeled.txt
+  test:
+    filelist: data/ShapeNet/filelist/test_im_5_labeled.txt
+
+MODEL:
+  FractalGen:
+    use_class_cond: True
+    num_classes: 5
