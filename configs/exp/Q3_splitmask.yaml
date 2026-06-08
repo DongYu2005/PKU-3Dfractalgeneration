@@ -1,0 +1,36 @@
+# Q3: Q2 (163.5M, scaled) + split-structure MaskGIT.
+# Trains each level's split head to predict masked splits from revealed-split
+# context; at generation refines the split over split_iters iterative reveal
+# steps. Directly targets split quality (missing depth-6 nodes -> surface holes)
+# while staying ~10-40x faster than OctGPT's 576-step decode. Warm-started from
+# Q2's final checkpoint (split_emb/split_mask_emb zero-init -> equivalent start).
+
+BASE:
+  - configs/shapenet_frac_im5.yaml
+
+SOLVER:
+  logdir: logs/exp/Q3_splitmask
+  max_epoch: 20
+
+DATA:
+  train:
+    filelist: data/ShapeNet/filelist/train_im_5_labeled.txt
+  test:
+    filelist: data/ShapeNet/filelist/test_im_5_labeled.txt
+
+MODEL:
+  FractalGen:
+    feature_dim: 768
+    num_heads: 8
+    mid_blocks_per_level: [3, 3, 3]
+    blocks_per_level: 12
+    use_class_cond: True
+    num_classes: 5
+    cond_every_level: True
+    use_latent: True
+    latent_dim: 256
+    kl_weight: 0.0001
+    split_mask: True
+    split_iters: 6
+    split_temp: 1.0
+    split_sample: False

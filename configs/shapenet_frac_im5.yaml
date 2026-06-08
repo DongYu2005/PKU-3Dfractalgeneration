@@ -136,6 +136,10 @@ MODEL:
     leaf_vq_mask: False
     leaf_vq_iters: 1
     leaf_vq_temp: 1.0
+    # split-structure MaskGIT (structure quality): off by default
+    split_mask: False
+    split_iters: 1
+    split_temp: 1.0
 
 # top-level: number of meshes to generate (used by SOLVER.run=generate)
 num_generate: 30

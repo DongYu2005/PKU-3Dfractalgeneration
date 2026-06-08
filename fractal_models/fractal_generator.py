@@ -208,6 +208,14 @@ class FractalGenerator(nn.Module):
         leaf_vq_mask: bool = False,
         leaf_vq_iters: int = 1,
         leaf_vq_temp: float = 1.0,
+        # split-structure MaskGIT: at each level, embed revealed splits as input
+        # (split_emb) and predict masked ones; at generation, refine the split
+        # structure over split_iters iterative reveal steps. Attacks split
+        # quality (missing depth-6 nodes -> surface holes) directly. Few steps
+        # (4-8) -> still ~10-40x faster than OctGPT's 576.
+        split_mask: bool = False,
+        split_iters: int = 1,
+        split_temp: float = 1.0,
         **kwargs,
     ):
         super().__init__()
@@ -276,6 +284,14 @@ class FractalGenerator(nn.Module):
         self.leaf_vq_temp = leaf_vq_temp
         if self.leaf_vq_mask:
             self.leaf_vq_mask_emb = nn.Parameter(torch.zeros(1, feature_dim))
+
+        # ---- split-structure MaskGIT ----
+        self.split_mask = split_mask
+        self.split_iters = split_iters
+        self.split_temp = split_temp
+        if self.split_mask:
+            self.split_emb = nn.Embedding(2, feature_dim)
+            self.split_mask_emb = nn.Parameter(torch.zeros(1, feature_dim))
 
         # ---- spatial position projection ----
         self.pos_proj = nn.Linear(3, feature_dim)
@@ -355,6 +371,10 @@ class FractalGenerator(nn.Module):
             nn.init.zeros_(self.leaf_vq_mask_emb)
             nn.init.zeros_(self.vq_proj.weight)
             nn.init.zeros_(self.vq_proj.bias)
+        # zero split-token path so warm-start starts equivalent to single-pass
+        if self.split_mask:
+            nn.init.zeros_(self.split_emb.weight)
+            nn.init.zeros_(self.split_mask_emb)
 
     @staticmethod
     def _init_weights(module):
@@ -470,6 +490,40 @@ class FractalGenerator(nn.Module):
             indices[~known] = samp[~known]
         return indices
 
+    @torch.no_grad()
+    def _split_generate(self, features, octree, depth, lvl):
+        """Iterative MaskGIT decode of the split at one level (split_iters steps,
+        cosine reveal, confidence-based). Returns (split [n] long, feat [n,dim]
+        from a final fully-revealed pass for expansion)."""
+        import math
+        n = features.shape[0]
+        device = features.device
+        iters = max(1, self.split_iters)
+        t = self.split_temp if self.split_temp > 0 else 1.0
+        split = torch.zeros(n, dtype=torch.long, device=device)
+        known = torch.zeros(n, dtype=torch.bool, device=device)
+        for k in range(iters):
+            tok = torch.where(known.unsqueeze(1), self.split_emb(split),
+                              self.split_mask_emb.expand(n, -1))
+            feat = self._run_mid_transformer(features + tok, octree, depth, lvl)
+            probs = F.softmax(self.split_heads[lvl](feat) / t, dim=-1)
+            samp = torch.bernoulli(probs[:, 1]).long()
+            conf = probs.gather(1, samp.unsqueeze(1)).squeeze(1)
+            target = n if k == iters - 1 else int(
+                round(n * (1.0 - math.cos(math.pi / 2 * (k + 1) / iters))))
+            newly = target - int(known.sum().item())
+            if newly > 0:
+                conf_avail = conf.masked_fill(known, -1.0)
+                topk = torch.topk(conf_avail, min(newly, int((~known).sum().item()))).indices
+                split[topk] = samp[topk]
+                known[topk] = True
+        if not bool(known.all()):
+            split[~known] = torch.bernoulli(probs[:, 1][~known]).long()
+        # final fully-revealed pass -> expansion features (matches training)
+        feat = self._run_mid_transformer(
+            features + self.split_emb(split), octree, depth, lvl)
+        return split, feat
+
     def _expand_features(self, features, split_mask, level_idx):
         parents = features[split_mask]
         n = parents.shape[0]
@@ -584,8 +638,24 @@ class FractalGenerator(nn.Module):
             mask = self._sample_mask(n, device, force_full=not self.training)
 
             apply_mask = (self.use_masked_training and self.training and n > 0)
+            split_mask_active = self.split_mask and self.training and n > 0
 
-            if apply_mask:
+            if split_mask_active:
+                # Split MaskGIT: embed revealed GT splits as input, predict the
+                # masked ones. Two passes: a fully-revealed pass feeds expansion
+                # (matches generation's final state), a masked pass gives the
+                # loss. split_emb/split_mask_emb are zero-init so warm-start
+                # starts equivalent to single-pass.
+                gt_split_d = (octree_gt.children[d] >= 0).long()
+                feat_rev = self._run_mid_transformer(
+                    features + self.split_emb(gt_split_d), octree_gt, d, lvl)
+                inp = features + torch.where(
+                    mask.unsqueeze(1), self.split_mask_emb.expand(n, -1),
+                    self.split_emb(gt_split_d))
+                features_for_pred = self._run_mid_transformer(
+                    inp, octree_gt, d, lvl)
+                features = feat_rev
+            elif apply_mask:
                 # Masked path: mask BEFORE mid_transformer so the transformer
                 # learns to infer masked nodes from context (BERT-style).
                 # Keep a clean copy for expansion (matches generate() flow).
@@ -614,7 +684,7 @@ class FractalGenerator(nn.Module):
             gt_split = (octree_gt.children[d] >= 0).long()
 
             # Loss (respects use_focal_loss in all branches)
-            if apply_mask and mask.any():
+            if (apply_mask or split_mask_active) and mask.any():
                 if self.use_focal_loss:
                     loss_lvl = self.focal_loss(logits[mask], gt_split[mask])
                 else:
@@ -732,21 +802,26 @@ class FractalGenerator(nn.Module):
         for lvl in range(self.num_levels):
             d = self.full_depth + lvl
 
-            if features.shape[0] > 0:
-                features = self._run_mid_transformer(
-                    features, octree, d, lvl)
-
-            logits = self.split_heads[lvl](features)
-            probs = F.softmax(logits, dim=-1)
-            if self.split_sample:
-                split = torch.bernoulli(probs[:, 1]).long()
+            if features.shape[0] > 0 and self.split_mask:
+                # iterative MaskGIT split refinement; feat is the revealed-pass
+                # features used for expansion
+                split, feat = self._split_generate(features, octree, d, lvl)
             else:
-                split = (probs[:, 1] > self.split_threshold).long()
+                if features.shape[0] > 0:
+                    features = self._run_mid_transformer(
+                        features, octree, d, lvl)
+                logits = self.split_heads[lvl](features)
+                probs = F.softmax(logits, dim=-1)
+                if self.split_sample:
+                    split = torch.bernoulli(probs[:, 1]).long()
+                else:
+                    split = (probs[:, 1] > self.split_threshold).long()
+                feat = features
 
             octree.octree_split(split, d)
             octree.octree_grow(d + 1)
 
-            features = self._expand_features(features, split.bool(), lvl)
+            features = self._expand_features(feat, split.bool(), lvl)
             if features.shape[0] == 0:
                 break
 
