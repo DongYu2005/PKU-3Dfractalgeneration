@@ -646,11 +646,12 @@ class FractalGenerator(nn.Module):
                 # (matches generation's final state), a masked pass gives the
                 # loss. split_emb/split_mask_emb are zero-init so warm-start
                 # starts equivalent to single-pass.
-                # VARIED mask ratio (covers near-0 .. near-1) so the model sees
-                # every reveal level, incl. the near-fully-masked regime the
-                # early generation iterations hit. (Fixed 0.7 was a bug: the
-                # model never saw <30%-revealed -> generation cascaded.)
-                ratio = float(torch.empty(1).uniform_(0.05, 1.0).item())
+                # HEAVY mask ratio (0.8-1.0). Near-fully-masked removes the
+                # "copy revealed neighbours" shortcut, forcing prediction from
+                # features+conditioning (the hard, useful regime that the early
+                # generation iterations hit). Light masking (earlier 0.05-1.0)
+                # let the model cheat off revealed GT and degraded single-pass.
+                ratio = float(torch.empty(1).uniform_(0.8, 1.0).item())
                 k_m = max(1, int(round(n * ratio)))
                 perm = torch.randperm(n, device=device)
                 mask = torch.zeros(n, dtype=torch.bool, device=device)
