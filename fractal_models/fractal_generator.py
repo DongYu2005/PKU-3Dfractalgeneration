@@ -375,6 +375,12 @@ class FractalGenerator(nn.Module):
         if self.split_mask:
             nn.init.zeros_(self.split_emb.weight)
             nn.init.zeros_(self.split_mask_emb)
+        # zero sibling-attn output so warm-start from a no-sibling ckpt starts
+        # equivalent (children += sib_out, sib_out=0 at init); learned from there
+        if self.use_sibling_attn:
+            for exp in self.feature_expanders:
+                nn.init.zeros_(exp.sibling_attn.out_proj.weight)
+                nn.init.zeros_(exp.sibling_attn.out_proj.bias)
 
     @staticmethod
     def _init_weights(module):

@@ -1,0 +1,34 @@
+# Q4: Q2 (163.5M scaled) + sibling self-attention in the expander.
+# Fixes the expander's MLP-degeneration (parent->8 children cross-attn has
+# context length K=1 -> degenerates to MLP; the 8 children never communicate).
+# sibling_attn lets the 8 octant children attend to each other (real K=8 attn)
+# -> better child features -> better split prediction. Single-pass (no split
+# iteration, which we showed only sparsifies). Warm-started from Q2
+# (sibling out_proj zero-init -> equivalent start).
+
+BASE:
+  - configs/shapenet_frac_im5.yaml
+
+SOLVER:
+  logdir: logs/exp/Q4_sibling
+  max_epoch: 20
+
+DATA:
+  train:
+    filelist: data/ShapeNet/filelist/train_im_5_labeled.txt
+  test:
+    filelist: data/ShapeNet/filelist/test_im_5_labeled.txt
+
+MODEL:
+  FractalGen:
+    feature_dim: 768
+    num_heads: 8
+    mid_blocks_per_level: [3, 3, 3]
+    blocks_per_level: 12
+    use_class_cond: True
+    num_classes: 5
+    cond_every_level: True
+    use_latent: True
+    latent_dim: 256
+    kl_weight: 0.0001
+    use_sibling_attn: True
