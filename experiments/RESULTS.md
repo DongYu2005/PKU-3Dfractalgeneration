@@ -59,3 +59,70 @@ Planned base config: `configs/shapenet_frac_im5.yaml` (im_5, 5 categories, 20438
 | inference forward count | = 4 | 4 |
 | training time / epoch | ≤ 4× baseline | TBD |
 | FID vs OctGPT | within 20% | TBD |
+
+## 空洞诊断（2026-07-02，eval/diag_split.py）
+
+问题：过拟合与多类别生成的 mesh 都有空洞，怀疑 split 漏判。逐项定位后结论是两个场景病因完全不同，且都不在原先假设的位置。
+
+### 过拟合（O1，单飞机）：split 无罪，洞在 marching cubes iso-level
+
+| 证据 | 数值 |
+|---|---|
+| teacher-forced FN（生成阈值 0.45 判决，三层） | 0 / 0 / 0 |
+| 自由生成 vs GT，各层 missing | 全部 0，depth-6 IoU 0.993 |
+| GT token + GT 结构的 ceiling 解码（`vqvae_ceiling_v2.py`） | 同样满身孔洞 |
+| 未量化 code / cond ckpt 解码（ceiling_decomp/） | 同样孔洞（排除量化损失与 ckpt 变体） |
+| ceiling 解码 + `mc_level=0.01` 提 mesh（level_sweep/） | 孔洞消失 |
+| O1 模型输出 + `mc_level=0.01`（gen_mclevel001/） | 干净完整飞机 |
+
+结论：孔洞是 VQ-VAE 解码 SDF 在 0.002 等值面附近的噪声带，提高 iso-level 到 ~0.01 免费解决。
+`SOLVER.mc_level`（main_fractal.py）/ `--mc_level`（eval/gen_from_ckpt.py）已可配置。
+注意 HF 上 OctGPT 官方只发布了 vqvae_large_im5（与本地权重一致），论文用的 huge 版不可得，
+这个 SDF 噪声带就是当前 frozen VQ-VAE 的固有属性。
+
+### 多类别（Q4，prior z 真实生成域）：粗层 split FN + VQ token 噪声
+
+teacher-forced（posterior z，16 个测试样本，阈值 0.45）：
+
+| lvl | depth | GT pos | FN% | 丢失 depth-6 叶子 |
+|---|---|---|---|---|
+| 0 | 3 | 690 | **21.45%** | 8400 |
+| 1 | 4 | 2231 | 8.43% | 3952 |
+| 2 | 5 | 8518 | 5.66% | 3856 |
+
+最大问题在最粗层 depth 3（此前报告聚焦"最后一级 acc ~0.80"是被 accuracy 指标掩盖的错误结论，
+新增的 per-level recall/precision 指标可直接暴露）。自由生成 depth-6 缺失 29.3%，IoU 0.33。
+
+免训练修复测试：
+
+| 手段 | 效果 |
+|---|---|
+| 粗层低阈值（0.2/0.35/0.45 等） | missing 29%→5%，但 extra 爆炸（叶子 4-9 倍），prior z 下渲染成噪声云，**不可用** |
+| `split_close_k=3`（最后层闭运算） | missing 17.2%→15.7%（同 8 样本），作用有限：缺失主要是 depth 4/5 级联，不是孤立点 |
+| **`temperature=0` + `mc_level=0.01`**（gen_t0_lvl001/） | **质变**：噪声云→实心可辨认物体（chair/car 清晰成形，airplane 仍是过密三角翼团块） |
+
+结论：多类别的"空洞/散点"外观大头是 VQ token 采样噪声 + iso-level，而非结构缺失；
+结构侧剩余问题集中在 depth-3 的 21% FN（模型对粗层形体不确定，focal loss 校准差），
+这是训练侧问题（Stage 2：粗层加权 / scheduled sampling），阈值旋钮救不了。
+
+## R1b 飞机单类实验结果（2026-07-02，粗层加权 + 空间池化 latent）
+
+warm-start 自 Q4，飞机类 2831 train / 809 test，30 epoch（4h55m 单卡）。
+
+| 指标 | Q4 基线（五类） | R1b（飞机类） |
+|---|---|---|
+| split_recall_lvl0 (test) | ~0.786（FN 21.4%） | **0.948** |
+| split_accuracy | 0.841 | 0.915 |
+| vq_accuracy | 0.645 | 0.731 |
+| kl_loss | ~0.5 | 1.17（z 携带信息量翻倍） |
+| 自由生成 depth-6 IoU（posterior z） | 0.33 | 0.42（阈值 [0.45,0.5,0.6] 时 0.467） |
+
+结论：
+- 两个改动方向都有效：粗层 FN 大降、z 开始生效（posterior 与 prior 生成的结构可区分）。
+- **但 prior z 生成的飞机仍是菱形团块**：recall 偏置让 precision 掉到 0.81
+  （生成叶子 2.4 倍于 GT），细层阈值拉高只能换 IoU 到 0.467，救不回轮廓。
+- `split_sample`（全层伯努利采样）生成碎片，排除。
+- 根本瓶颈定位：单次前向对每个节点按**独立边缘概率**判决，多模式被平均成团块；
+  z 的模式选择能力不足以完全消除。这是与 OctGPT（576 步空间自回归，逐步承诺）
+  的本质差距。候选修法：只在 depth-3（≤512 节点）做 4-8 步迭代 refinement
+  （成本 +8 次 forward，仍保 ~50x 速度优势），区别于失败的 Q3（全层+错误训练策略）。

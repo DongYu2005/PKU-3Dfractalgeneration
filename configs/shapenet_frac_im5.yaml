@@ -24,6 +24,9 @@ SOLVER:
   # mesh extraction
   resolution: 256
   sdf_scale: 0.9
+  # marching cubes iso-level; 0.002 sits in the VQ-VAE SDF noise band and
+  # gives pockmarked surfaces, ~0.01 closes the pinholes (see RESULTS.md)
+  mc_level: 0.002
 
 
 DATA:
@@ -132,6 +135,14 @@ MODEL:
     latent_dim: 256
     vq_code_dim: 32
     kl_weight: 0.0001
+    # spatially-aware latent pooling (per 8^full_depth cell instead of global
+    # mean); gives z the coarse layout the depth-3 split head is missing
+    latent_spatial_pool: False
+    # per-level split loss weights ([1,1,1] = uniform v4 behavior); coarse
+    # levels deserve more weight since a missed split kills a whole subtree
+    level_loss_weights: [1, 1, 1]
+    # generation-side knobs added after the hole diagnosis (see RESULTS.md)
+    split_close_k: 0
     # leaf VQ MaskGIT (surface detail): off by default
     leaf_vq_mask: False
     leaf_vq_iters: 1

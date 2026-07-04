@@ -23,12 +23,22 @@ ap.add_argument("--out_dir", required=True)
 ap.add_argument("--per_class", type=int, default=3)
 ap.add_argument("--split_sample", type=int, default=0)
 ap.add_argument("--temperature", type=float, default=0.8)
+ap.add_argument("--split_threshold", type=str, default="",
+                help="override, scalar or comma list per level")
+ap.add_argument("--split_close_k", type=int, default=-1,
+                help="override morphological closing (-1 = keep config)")
+ap.add_argument("--mc_level", type=float, default=0.002,
+                help="marching cubes iso-level (~0.01 closes SDF pinholes)")
 a,_ = ap.parse_known_args()
 sys.argv=[sys.argv[0],"--config",a.config]; F=parse_args()
 dev="cuda"; os.makedirs(a.out_dir, exist_ok=True)
 depth_stop=F.MODEL.depth_stop; depth=F.MODEL.depth
 
 cfg=dict(F.MODEL.FractalGen); cfg["split_sample"]=bool(a.split_sample)
+if a.split_threshold:
+    vals=[float(v) for v in a.split_threshold.split(",")]
+    cfg["split_threshold"]=vals[0] if len(vals)==1 else vals
+if a.split_close_k>=0: cfg["split_close_k"]=a.split_close_k
 m=FractalGenerator(**cfg).to(dev).eval()
 m.load_state_dict(torch.load(a.ckpt, map_location=dev, weights_only=True))
 vq=builder.build_vae_model(F.MODEL.VQVAE).to(dev).eval()
@@ -47,7 +57,7 @@ for c in range(len(SYN)):
             oct.octree_split(torch.zeros(oct.nnum[d],device=dev).long(),d); oct.octree_grow(d+1)
         dt=OctreeD(oct); out=vq.decode_code(vqc,depth_stop,dt,copy.deepcopy(dt),update_octree=True)
         p=os.path.join(a.out_dir,f"{SYN[c]}_{i}.obj")
-        utils.create_mesh(out["neural_mpu"],p,size=F.SOLVER.resolution,level=0.002,clean=True,
+        utils.create_mesh(out["neural_mpu"],p,size=F.SOLVER.resolution,level=a.mc_level,clean=True,
             bbmin=-F.SOLVER.sdf_scale,bbmax=F.SOLVER.sdf_scale,mesh_scale=F.DATA.test.points_scale,save_sdf=False)
         print(f"  {SYN[c]}_{i}: leaves(d6)={oct.nnum[depth_stop].item()}")
 print("done ->", a.out_dir)

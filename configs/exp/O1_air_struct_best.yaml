@@ -1,0 +1,29 @@
+# Single-airplane overfit showcase: structure-oriented best small variant.
+# Warm-start from logs/fractal/overfit_thresh050/checkpoints/00300.model.pth,
+# then fine-tune the most useful 384-dim structural flags seen in ablations:
+# global buffer, coarse-level capacity, and sibling attention.
+
+BASE:
+  - configs/shapenet_frac_im5.yaml
+
+SOLVER:
+  logdir: logs/exp/O1_air_struct_best
+  max_epoch: 30
+  test_every_epoch: 10
+  log_per_iter: 50
+  gen_every_epoch: 10
+
+DATA:
+  train:
+    filelist: data/ShapeNet/filelist/overfit.txt
+    batch_size: 1
+    num_workers: 2
+  test:
+    filelist: data/ShapeNet/filelist/overfit.txt
+    batch_size: 1
+
+MODEL:
+  FractalGen:
+    buffer_size: 32
+    mid_blocks_per_level: [4, 2, 1]
+    use_sibling_attn: True

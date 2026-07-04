@@ -1,0 +1,31 @@
+# Single-airplane overfit showcase: structure + leaf surface-token refinement.
+# Same structural flags as O1 plus leaf VQ MaskGIT, targeting the remaining
+# VQ-token/surface-detail gap after split topology has already overfit.
+
+BASE:
+  - configs/shapenet_frac_im5.yaml
+
+SOLVER:
+  logdir: logs/exp/O2_air_surface_best
+  max_epoch: 30
+  test_every_epoch: 10
+  log_per_iter: 50
+  gen_every_epoch: 10
+
+DATA:
+  train:
+    filelist: data/ShapeNet/filelist/overfit.txt
+    batch_size: 1
+    num_workers: 2
+  test:
+    filelist: data/ShapeNet/filelist/overfit.txt
+    batch_size: 1
+
+MODEL:
+  FractalGen:
+    buffer_size: 32
+    mid_blocks_per_level: [4, 2, 1]
+    use_sibling_attn: True
+    leaf_vq_mask: True
+    leaf_vq_iters: 4
+    leaf_vq_temp: 0.8

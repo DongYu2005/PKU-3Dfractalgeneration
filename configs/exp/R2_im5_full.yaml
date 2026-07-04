@@ -1,0 +1,37 @@
+# R2: 5-class (im5) with the full structure fix — coarse-weighted split loss
+# + spatially-pooled latent. Warm-start from Q4 (z_mu/z_logvar retrained due
+# to input dim change). This is the main-goal run; R1a/R1b (airplane-only)
+# are the single-variable pilots for attribution.
+# 4-GPU DDP, bs8/GPU (effective 32 vs Q4's 16; lr kept constant 1e-4).
+
+BASE:
+  - configs/shapenet_frac_im5.yaml
+
+SOLVER:
+  logdir: logs/exp/R2_im5_full
+  max_epoch: 20
+  test_every_epoch: 5
+  gen_every_epoch: 5
+  mc_level: 0.01
+
+DATA:
+  train:
+    filelist: data/ShapeNet/filelist/train_im_5_labeled.txt
+  test:
+    filelist: data/ShapeNet/filelist/test_im_5_labeled.txt
+
+MODEL:
+  FractalGen:
+    feature_dim: 768
+    num_heads: 8
+    mid_blocks_per_level: [3, 3, 3]
+    blocks_per_level: 12
+    use_class_cond: True
+    num_classes: 5
+    cond_every_level: True
+    use_latent: True
+    latent_dim: 256
+    kl_weight: 0.0001
+    use_sibling_attn: True
+    level_loss_weights: [4, 2, 1]
+    latent_spatial_pool: True

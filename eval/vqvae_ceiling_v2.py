@@ -19,6 +19,8 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--config", required=True)
 ap.add_argument("--out_dir", default="logs/exp/_ceiling_v2")
 ap.add_argument("--per_class", type=int, default=1)
+ap.add_argument("--mc_level", type=float, default=0.002,
+                help="marching cubes iso-level (~0.01 closes SDF pinholes)")
 a,_ = ap.parse_known_args()
 sys.argv=[sys.argv[0],"--config",a.config]; F=parse_args()
 dev="cuda"; os.makedirs(a.out_dir, exist_ok=True)
@@ -54,7 +56,7 @@ for batch in loader:
         doctree=OctreeD(oct6)
         out=vqvae.decode_code(vq_code, depth_stop, doctree, copy.deepcopy(doctree), update_octree=True)
     path=os.path.join(a.out_dir, f"{SYN[c]}_{seen[c]}.obj")
-    utils.create_mesh(out["neural_mpu"], path, size=F.SOLVER.resolution, level=0.002,
+    utils.create_mesh(out["neural_mpu"], path, size=F.SOLVER.resolution, level=a.mc_level,
         clean=True, bbmin=-F.SOLVER.sdf_scale, bbmax=F.SOLVER.sdf_scale,
         mesh_scale=F.DATA.test.points_scale, save_sdf=False)
     seen[c]+=1; done+=1

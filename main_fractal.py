@@ -208,11 +208,15 @@ class FractalSolver(Solver):
             copy.deepcopy(doctree), update_octree=True)
 
         # ---- Extract mesh via marching cubes ----
+        # mc_level: marching-cubes iso-level. The default 0.002 sits inside the
+        # decoder's SDF noise band and produces pockmarked surfaces even on
+        # GT-token ceiling decodes; ~0.01 closes those pinholes (see
+        # logs/exp/O1_air_struct_best/level_sweep).
         utils.create_mesh(
             output['neural_mpu'],
             mesh_path,
             size=self.FLAGS.SOLVER.resolution,
-            level=0.002,
+            level=self.FLAGS.SOLVER.get('mc_level', 0.002),
             clean=True,
             bbmin=-self.FLAGS.SOLVER.sdf_scale,
             bbmax=self.FLAGS.SOLVER.sdf_scale,

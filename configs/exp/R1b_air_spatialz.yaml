@@ -1,0 +1,38 @@
+# R1b: R1a + spatially-pooled latent (per depth-3 cell instead of global
+# mean). The Q4 latent was structure-blind (posterior z and prior z generate
+# the same shape); per-cell pooling puts coarse spatial layout into z so the
+# depth-3 split head has instance information to commit to. z_mu/z_logvar
+# change input dim (32 -> 32*512) and are trained fresh; everything else
+# warm-starts from Q4.
+
+BASE:
+  - configs/shapenet_frac_im5.yaml
+
+SOLVER:
+  logdir: logs/exp/R1b_air_spatialz
+  max_epoch: 30
+  test_every_epoch: 5
+  gen_every_epoch: 10
+  mc_level: 0.01
+
+DATA:
+  train:
+    filelist: data/ShapeNet/filelist/train_air_labeled.txt
+  test:
+    filelist: data/ShapeNet/filelist/test_air_labeled.txt
+
+MODEL:
+  FractalGen:
+    feature_dim: 768
+    num_heads: 8
+    mid_blocks_per_level: [3, 3, 3]
+    blocks_per_level: 12
+    use_class_cond: True
+    num_classes: 5
+    cond_every_level: True
+    use_latent: True
+    latent_dim: 256
+    kl_weight: 0.0001
+    use_sibling_attn: True
+    level_loss_weights: [4, 2, 1]
+    latent_spatial_pool: True

@@ -1,0 +1,36 @@
+# R1a: airplane-class generative model, Q4 architecture, coarse-weighted
+# split loss. Attacks the diagnosed depth-3 FN bottleneck (21% at thr 0.45)
+# by weighting coarse levels by (approx) subtree cost. Warm-start from Q4
+# (identical architecture, pure data + loss-weight change).
+# Single-variable vs R1b: R1b adds latent_spatial_pool on top of this.
+
+BASE:
+  - configs/shapenet_frac_im5.yaml
+
+SOLVER:
+  logdir: logs/exp/R1a_air_levelw
+  max_epoch: 30
+  test_every_epoch: 5
+  gen_every_epoch: 10
+  mc_level: 0.01
+
+DATA:
+  train:
+    filelist: data/ShapeNet/filelist/train_air_labeled.txt
+  test:
+    filelist: data/ShapeNet/filelist/test_air_labeled.txt
+
+MODEL:
+  FractalGen:
+    feature_dim: 768
+    num_heads: 8
+    mid_blocks_per_level: [3, 3, 3]
+    blocks_per_level: 12
+    use_class_cond: True
+    num_classes: 5
+    cond_every_level: True
+    use_latent: True
+    latent_dim: 256
+    kl_weight: 0.0001
+    use_sibling_attn: True
+    level_loss_weights: [4, 2, 1]

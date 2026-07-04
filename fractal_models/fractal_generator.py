@@ -32,6 +32,23 @@ from octgpt.models.positional_embedding import SinPosEmb, AbsPosEmb, RMSNorm
 from octgpt.utils.utils import depth2batch, batch2depth
 
 
+def split_recall_precision(pred: torch.Tensor, gt: torch.Tensor):
+    """Recall/precision of the split=1 class. Accuracy is dominated by the
+    abundant negatives and hides missed splits (false negatives), which are
+    exactly what create surface holes: a missed split at depth d kills the
+    whole subtree (up to 8^(depth_stop-d) leaves). Empty denominators report
+    1.0 so batches without positives don't drag the tracker average down."""
+    one = torch.ones((), device=pred.device)
+    pos = gt == 1
+    pred_pos = pred == 1
+    tp = (pred_pos & pos).sum().float()
+    npos = pos.sum().float()
+    npred = pred_pos.sum().float()
+    recall = torch.where(npos > 0, tp / npos.clamp(min=1), one)
+    precision = torch.where(npred > 0, tp / npred.clamp(min=1), one)
+    return recall, precision
+
+
 # ============================================================================
 # Focal Loss (handles extreme class imbalance in split prediction)
 # ============================================================================
@@ -160,8 +177,17 @@ class FractalGenerator(nn.Module):
         # Focal Loss params
         focal_alpha: float = 0.75,
         focal_gamma: float = 2.0,
-        # Generation threshold for split
-        split_threshold: float = 0.45,
+        # Generation threshold for split: scalar, or a list of num_levels
+        # values (one per expansion level). A missed split at a coarse level
+        # kills the whole subtree (up to 8^(depth_stop-d) leaves -> a hole),
+        # while a spurious split can still be rejected at the next level, so
+        # coarse levels can afford a lower (recall-biased) threshold.
+        split_threshold=0.45,
+        # Morphological closing on the generated split (0 = off): at the last
+        # expansion level, a node predicted non-split is forced to split when
+        # >= split_close_k of its 6 face-adjacent neighbors split. Fills
+        # isolated false-negative leaves (small surface holes).
+        split_close_k: int = 0,
         # ====== v5 experiment flags ======
         # 建议 1: masked training
         use_masked_training: bool = False,
@@ -201,6 +227,18 @@ class FractalGenerator(nn.Module):
         latent_dim: int = 256,
         vq_code_dim: int = 32,
         kl_weight: float = 1e-4,
+        # spatially-aware latent: pool the GT VQ code per full_depth cell
+        # (8^full_depth cells) instead of one global mean. A global mean is
+        # structure-blind (average surface descriptor), which is why the Q4
+        # latent never influenced the split; per-cell pooling puts coarse
+        # spatial layout into z, exactly the information the depth-3 split
+        # head is missing.
+        latent_spatial_pool: bool = False,
+        # per-level split loss weights (None = uniform, v4 behavior). A missed
+        # split at depth d kills 8^(depth_stop-d) leaves, so coarse levels
+        # deserve more weight, e.g. [4, 2, 1]. Diagnosed depth-3 FN 21% is the
+        # structural bottleneck in multi-class generation.
+        level_loss_weights: list = None,
         # leaf VQ MaskGIT: train the leaf VQ head to predict masked tokens from
         # visible-token context (vq_proj embeds known tokens), so at generation
         # the surface tokens can be refined over a few iterative reveal steps
@@ -230,7 +268,13 @@ class FractalGenerator(nn.Module):
         self.vq_weight = vq_weight
         self.vq_groups = vq_groups
         self.vq_size = vq_size
+        if isinstance(split_threshold, (list, tuple)):
+            assert len(split_threshold) == self.num_levels, (
+                f"split_threshold list length ({len(split_threshold)}) "
+                f"must equal num_levels ({self.num_levels})")
+            split_threshold = [float(t) for t in split_threshold]
         self.split_threshold = split_threshold
+        self.split_close_k = split_close_k
 
         # v5 flags
         self.use_masked_training = use_masked_training
@@ -239,6 +283,14 @@ class FractalGenerator(nn.Module):
         self.use_sibling_attn = use_sibling_attn
         self.use_focal_loss = use_focal_loss
         self.metric_mask_ratio = metric_mask_ratio
+
+        # Per-level split loss weights
+        if level_loss_weights is not None:
+            assert len(level_loss_weights) == self.num_levels, (
+                f"level_loss_weights length ({len(level_loss_weights)}) "
+                f"must equal num_levels ({self.num_levels})")
+            level_loss_weights = [float(w) for w in level_loss_weights]
+        self.level_loss_weights = level_loss_weights
 
         # Per-level mid_transformer depths
         if mid_blocks_per_level is None:
@@ -272,9 +324,13 @@ class FractalGenerator(nn.Module):
         self.use_latent = use_latent
         self.latent_dim = latent_dim
         self.kl_weight = kl_weight
+        self.latent_spatial_pool = latent_spatial_pool
+        self.latent_pool_cells = (
+            8 ** full_depth if latent_spatial_pool else 1)
         if self.use_latent:
-            self.z_mu = nn.Linear(vq_code_dim, latent_dim)
-            self.z_logvar = nn.Linear(vq_code_dim, latent_dim)
+            z_in_dim = vq_code_dim * self.latent_pool_cells
+            self.z_mu = nn.Linear(z_in_dim, latent_dim)
+            self.z_logvar = nn.Linear(z_in_dim, latent_dim)
             # z_proj zeroed after init so warm-start ignores z initially
             self.z_proj = nn.Linear(latent_dim, feature_dim)
 
@@ -530,6 +586,44 @@ class FractalGenerator(nn.Module):
             features + self.split_emb(split), octree, depth, lvl)
         return split, feat
 
+    def _threshold_for(self, lvl: int) -> float:
+        if isinstance(self.split_threshold, (list, tuple)):
+            return self.split_threshold[lvl]
+        return self.split_threshold
+
+    @torch.no_grad()
+    def _close_split_holes(self, split, octree, depth):
+        """Force-split nodes with >= split_close_k face-adjacent split
+        neighbors. Only fills isolated misses at this depth; a hole whose
+        parent was already dropped at a coarser level has no node here and
+        cannot be recovered."""
+        k = int(self.split_close_k)
+        if k <= 0 or split.numel() == 0:
+            return split
+        split_mask = split == 1
+        if not split_mask.any() or split_mask.all():
+            return split
+        x, y, z, b = octree.xyzb(depth)
+        pos = torch.stack([x, y, z], dim=1).long()
+        S = 2 ** depth
+        base = b.long() * (S ** 3)
+        keys = base + (pos[:, 0] * S + pos[:, 1]) * S + pos[:, 2]
+        split_keys = keys[split_mask]
+        offsets = torch.tensor(
+            [[1, 0, 0], [-1, 0, 0], [0, 1, 0],
+             [0, -1, 0], [0, 0, 1], [0, 0, -1]],
+            dtype=torch.long, device=split.device)
+        nb = pos.unsqueeze(1) + offsets.unsqueeze(0)          # [n, 6, 3]
+        valid = ((nb >= 0) & (nb < S)).all(dim=-1)            # [n, 6]
+        nb_keys = base.view(-1, 1) + (
+            nb[..., 0] * S + nb[..., 1]) * S + nb[..., 2]
+        hit = torch.isin(nb_keys, split_keys) & valid
+        force = (~split_mask) & (hit.sum(dim=1) >= k)
+        if force.any():
+            split = split.clone()
+            split[force] = 1
+        return split
+
     def _expand_features(self, features, split_mask, level_idx):
         parents = features[split_mask]
         n = parents.shape[0]
@@ -583,17 +677,29 @@ class FractalGenerator(nn.Module):
     def _encode_latent(self, vq_code, octree, batch_size):
         """Encode pooled GT VQ code into a latent z (VAE posterior) + KL.
 
-        Mean-pools the frozen VQ-VAE leaf code per sample, then maps to
-        (mu, logvar) and reparameterises. Returns (z, kl_loss)."""
+        Mean-pools the frozen VQ-VAE leaf code per sample (globally, or per
+        full_depth cell when latent_spatial_pool so z keeps coarse layout),
+        then maps to (mu, logvar) and reparameterises. Returns (z, kl_loss)."""
         bid = octree.batch_id(self.depth_stop, nempty=False).long()
         dim = vq_code.shape[1]
-        pooled = torch.zeros(batch_size, dim, device=vq_code.device,
+        cells = self.latent_pool_cells
+        if self.latent_spatial_pool:
+            x, y, z_, _ = octree.xyzb(self.depth_stop)
+            shift = self.depth_stop - self.full_depth
+            S = 2 ** self.full_depth
+            cell = ((x.long() >> shift) * S + (y.long() >> shift)) * S + \
+                (z_.long() >> shift)
+            slot = bid * cells + cell
+        else:
+            slot = bid
+        pooled = torch.zeros(batch_size * cells, dim, device=vq_code.device,
                              dtype=vq_code.dtype)
-        pooled.index_add_(0, bid, vq_code)
-        counts = torch.zeros(batch_size, device=vq_code.device,
+        pooled.index_add_(0, slot, vq_code)
+        counts = torch.zeros(batch_size * cells, device=vq_code.device,
                              dtype=vq_code.dtype)
-        counts.index_add_(0, bid, torch.ones_like(bid, dtype=vq_code.dtype))
+        counts.index_add_(0, slot, torch.ones_like(slot, dtype=vq_code.dtype))
         pooled = pooled / counts.clamp(min=1).unsqueeze(1)
+        pooled = pooled.reshape(batch_size, cells * dim)
         mu = self.z_mu(pooled)
         logvar = self.z_logvar(pooled)
         z = mu + (0.5 * logvar).exp() * torch.randn_like(mu)
@@ -629,6 +735,10 @@ class FractalGenerator(nn.Module):
         total_split_loss = torch.tensor(0.0, device=device)
         per_level_acc_mask = []  # mask-only accuracy (new primary metric)
         per_level_acc_all = []   # all-position accuracy (legacy v4 metric)
+        per_level_rec_mask = []   # split=1 recall, mask-only
+        per_level_prec_mask = []  # split=1 precision, mask-only
+        per_level_rec_all = []    # split=1 recall, all positions
+        per_level_prec_all = []   # split=1 precision, all positions
 
         # ---- 3. Fractal expansion ----
         for lvl in range(self.num_levels):
@@ -709,24 +819,37 @@ class FractalGenerator(nn.Module):
                 loss_lvl = self.focal_loss(logits, gt_split)
             else:
                 loss_lvl = F.cross_entropy(logits, gt_split)
+            if self.level_loss_weights is not None:
+                loss_lvl = loss_lvl * self.level_loss_weights[lvl]
             total_split_loss = total_split_loss + loss_lvl
 
             # Metrics: report both new (mask-only) and legacy (all-pos)
             with torch.no_grad():
+                pred_split = logits.argmax(-1)
                 if n > 0:
-                    acc_all_lvl = (
-                        logits.argmax(-1) == gt_split).float().mean()
+                    acc_all_lvl = (pred_split == gt_split).float().mean()
                 else:
                     acc_all_lvl = torch.tensor(0.0, device=device)
                 if mask.any():
                     acc_mask_lvl = (
-                        logits[mask].argmax(-1) == gt_split[mask]
-                    ).float().mean()
+                        pred_split[mask] == gt_split[mask]).float().mean()
+                    rec_lvl, prec_lvl = split_recall_precision(
+                        pred_split[mask], gt_split[mask])
                 else:
                     acc_mask_lvl = acc_all_lvl
+                    rec_lvl, prec_lvl = split_recall_precision(
+                        pred_split, gt_split)
+                rec_all_lvl, prec_all_lvl = split_recall_precision(
+                    pred_split, gt_split)
                 per_level_acc_all.append(acc_all_lvl)
                 per_level_acc_mask.append(acc_mask_lvl)
+                per_level_rec_mask.append(rec_lvl)
+                per_level_prec_mask.append(prec_lvl)
+                per_level_rec_all.append(rec_all_lvl)
+                per_level_prec_all.append(prec_all_lvl)
                 output[f'split_acc_lvl{lvl}'] = acc_mask_lvl
+                output[f'split_recall_lvl{lvl}'] = rec_lvl
+                output[f'split_prec_lvl{lvl}'] = prec_lvl
 
             # Expand using teacher-forced split
             split_mask_gt = (gt_split == 1)
@@ -756,7 +879,10 @@ class FractalGenerator(nn.Module):
         else:
             vq_logits = None
 
-        output["split_loss"] = total_split_loss / max(self.num_levels, 1)
+        loss_norm = (sum(self.level_loss_weights)
+                     if self.level_loss_weights is not None
+                     else self.num_levels)
+        output["split_loss"] = total_split_loss / max(loss_norm, 1)
         output["split_accuracy"] = (
             torch.stack(per_level_acc_mask).mean()
             if per_level_acc_mask else torch.tensor(0.0, device=device)
@@ -765,6 +891,12 @@ class FractalGenerator(nn.Module):
             torch.stack(per_level_acc_all).mean()
             if per_level_acc_all else torch.tensor(0.0, device=device)
         )
+        if per_level_rec_mask:
+            output["split_recall"] = torch.stack(per_level_rec_mask).mean()
+            output["split_precision"] = torch.stack(per_level_prec_mask).mean()
+            output["split_recall_all"] = torch.stack(per_level_rec_all).mean()
+            output["split_precision_all"] = (
+                torch.stack(per_level_prec_all).mean())
 
         # ---- 5. VQ loss (mask-only when leaf MaskGIT is on) ----
         if vq_logits is not None and gt_indices is not None:
@@ -790,12 +922,73 @@ class FractalGenerator(nn.Module):
         return output
 
     # ------------------------------------------------------------------
+    # Diagnostics
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def teacher_forced_probs(self, octree_gt, vqvae=None, label=None,
+                             posterior_z=True):
+        """Inference-path pass on the GT octree, expanded with the GT split.
+
+        Unlike forward(), this uses the generation-time feature path (no
+        masking) so the returned per-level P(split) can be judged under the
+        actual threshold rule: false negatives here are exactly the nodes a
+        free generation run would drop, isolated from cascade effects.
+        Returns a list of (probs_split1 [n], gt_split [n]) per level."""
+        device = octree_gt.device
+        z = None
+        if self.use_latent:
+            if posterior_z and vqvae is not None:
+                vq_code = vqvae.extract_code(octree_gt)
+                z, _ = self._encode_latent(
+                    vq_code, octree_gt, octree_gt.batch_size)
+            else:
+                z = torch.randn(
+                    octree_gt.batch_size, self.latent_dim, device=device)
+
+        features = self.root_embedding.expand(
+            octree_gt.nnum[self.full_depth], -1).contiguous()
+        features = features + self._get_pos_embed(octree_gt, self.full_depth)
+        features = self._inject_cond(
+            features, octree_gt, self.full_depth, label, z)
+
+        out = []
+        for lvl in range(self.num_levels):
+            d = self.full_depth + lvl
+            n = features.shape[0]
+            gt_split = (octree_gt.children[d] >= 0).long()
+            if n == 0:
+                out.append((torch.zeros(0, device=device), gt_split))
+                break
+            if self.split_mask:
+                # first generation iteration sees an all-masked split input
+                feat = self._run_mid_transformer(
+                    features + self.split_mask_emb.expand(n, -1),
+                    octree_gt, d, lvl)
+            else:
+                feat = self._run_mid_transformer(features, octree_gt, d, lvl)
+            probs = F.softmax(self.split_heads[lvl](feat), dim=-1)[:, 1]
+            out.append((probs, gt_split))
+
+            if self.split_mask:
+                # expansion features come from the fully-revealed pass,
+                # matching both training and generation's final state
+                feat = self._run_mid_transformer(
+                    features + self.split_emb(gt_split), octree_gt, d, lvl)
+            features = self._expand_features(feat, gt_split == 1, lvl)
+            features = features + self._get_pos_embed(octree_gt, d + 1)
+            if self.cond_every_level:
+                features = self._inject_cond(
+                    features, octree_gt, d + 1, label, z)
+        return out
+
+    # ------------------------------------------------------------------
     # Generation
     # ------------------------------------------------------------------
 
     @torch.no_grad()
     def generate(self, batch_size=1, device="cuda", temperature=0.8,
-                 vqvae=None, label=None):
+                 vqvae=None, label=None, z=None):
         """Generate with threshold-based split and temperature VQ sampling.
 
         Inference path: NO masking applied (mask_emb never touches features).
@@ -804,10 +997,13 @@ class FractalGenerator(nn.Module):
         octree = ocnn.octree.init_octree(
             self.depth_stop, self.full_depth, batch_size, device)
 
-        # latent prior sample (no GT at generation)
-        z = None
+        # latent prior sample (no GT at generation); an explicit z overrides,
+        # e.g. a GT-posterior z for reconstruction-style diagnostics
         if self.use_latent:
-            z = torch.randn(batch_size, self.latent_dim, device=device)
+            if z is None:
+                z = torch.randn(batch_size, self.latent_dim, device=device)
+        else:
+            z = None
 
         features = self.root_embedding.expand(
             octree.nnum[self.full_depth], -1).contiguous()
@@ -831,8 +1027,11 @@ class FractalGenerator(nn.Module):
                 if self.split_sample:
                     split = torch.bernoulli(probs[:, 1]).long()
                 else:
-                    split = (probs[:, 1] > self.split_threshold).long()
+                    split = (probs[:, 1] > self._threshold_for(lvl)).long()
                 feat = features
+
+            if lvl == self.num_levels - 1:
+                split = self._close_split_holes(split, octree, d)
 
             octree.octree_split(split, d)
             octree.octree_grow(d + 1)
