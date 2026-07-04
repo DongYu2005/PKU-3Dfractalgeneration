@@ -82,9 +82,19 @@ git clone https://github.com/octree-nn/octgpt.git octgpt
 pip install -r octgpt/requirements.txt
 ```
 
-**冻结 VQ-VAE 权重**（必需，整条 pipeline 的解码器）：从 HuggingFace [`wst2001/OctGPT`](https://huggingface.co/wst2001/OctGPT) 下载 `vqvae_large_im5_uncond_bsq32.pth`，放到 `saved_ckpt/`，config 中由 `vqvae_ckpt` 字段指定。
+### 预训练权重
 
-**数据**：ShapeNet 经 OctGPT 官方预处理流程得到，路径在 config 的 `DATA.*` 字段配置。
+全部权重来自 HuggingFace [`wst2001/OctGPT`](https://huggingface.co/wst2001/OctGPT)（即 OctGPT README 2.1 节的官方发布），下载后放到 `saved_ckpt/`：
+
+| 文件 | 用途 |
+|---|---|
+| `vqvae_large_im5_uncond_bsq32.pth` | **必需**。冻结 VQ-VAE，本方法整条 pipeline 的解码器，config 中由 `vqvae_ckpt` 字段指定 |
+| `octgpt_airplane.pth` | 可选。OctGPT 单类 baseline（报告中的速度/质量对比基线） |
+| `octgpt_im5.pth` + `vqvae_large_im5_cond_bsq32.pth` | 可选。OctGPT 类别条件 baseline |
+
+### 数据准备
+
+训练/评测数据是 **ShapeNet 经 OctGPT 官方预处理**得到的（OctGPT README 的 ShapeNet 数据准备流程，生成 SDF/八叉树监督所需的点云与 filelist），得到形如 `data/ShapeNet/datasets_256/` 的目录后，在 config 的 `DATA.train.*` / `DATA.test.*` 字段配置路径。只跑生成（不训练）则无需准备数据。
 
 ## 快速开始
 
@@ -108,6 +118,39 @@ python render_obj.py <mesh.obj>
 ```
 
 生成时常用的两个旋钮：`--temperature 0`（叶子 token argmax，消除 VQ 采样噪声）和 `--mc_level 0.01`（避开冻结解码器 SDF 的零点噪声带）。
+
+## OctGPT baseline 复现（可选）
+
+报告中的速度/质量对比基线，用 OctGPT 官方权重在 `octgpt/` 目录下运行（命令同 OctGPT README 2.2 节）：
+
+```bash
+cd octgpt
+
+# 无条件生成（airplane / car / chair / rifle / table 任选）
+export category=airplane && \
+python main_octgpt.py \
+    --config configs/ShapeNet/shapenet_uncond.yaml \
+    SOLVER.run generate \
+    SOLVER.ckpt ../saved_ckpt/octgpt_${category}.pth \
+    SOLVER.logdir logs/${category} \
+    MODEL.vqvae_ckpt ../saved_ckpt/vqvae_large_im5_uncond_bsq32.pth \
+    MODEL.OctGPT.patch_size 2048 \
+    MODEL.OctGPT.dilation 2
+
+# 类别条件生成
+export category=airplane && \
+python main_octgpt.py \
+    --config configs/ShapeNet/shapenet_uncond.yaml \
+    SOLVER.run generate \
+    SOLVER.ckpt ../saved_ckpt/octgpt_im5.pth \
+    SOLVER.logdir logs/im5 \
+    MODEL.vqvae_ckpt ../saved_ckpt/vqvae_large_im5_cond_bsq32.pth \
+    MODEL.OctGPT.condition_type category \
+    MODEL.OctGPT.num_classes 5 \
+    MODEL.OctGPT.patch_size 1024 \
+    MODEL.OctGPT.dilation 16 \
+    DATA.test.category ${category}
+```
 
 ## 相关仓库
 
