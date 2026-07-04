@@ -140,7 +140,17 @@ split accuracy 无法解释它：该指标被大量``不分裂''的负样本主�
 诊断同时给出了两个\emph{免训练}的生成端修复：叶子 token 改用 argmax
 （temperature=0，消除 VQ 采样噪声在 0.65 左右的 token 准确率下渲染成的``雪花''）、
 marching cubes 等值面 $\ell=0.01$（第 3 节）。二者叠加使 chair/car 等类别从噪声云
-变为轮廓清晰的实体。
+变为轮廓清晰的实体，图~\ref{fig:multiclass}展示了修复后五个类别的生成样本。
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=\linewidth]{multiclass_gen.png}
+    \caption{多类别条件生成样本（Q4 模型，从左到右：airplane / car / chair /
+    rifle / table，先验 $z$ 采样，temperature=0，$\ell=0.01$）。car、chair、rifle
+    轮廓清晰；airplane 呈现``类别平均''式的三角翼团块、table 有过度填充倾向，
+    对应第~6 节讨论的独立边缘判决的模式平均问题。}
+    \label{fig:multiclass}
+\end{figure}
 
 针对粗层瓶颈，我们在 Q4 基础上引入两个训练侧改动（记为 R2，warm-start 自 Q4）：
 \textbf{(1) 粗层加权 split loss}，按子树代价给各层 loss 乘以 $[4,2,1]$ 权重；
