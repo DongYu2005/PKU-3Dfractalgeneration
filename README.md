@@ -94,7 +94,20 @@ pip install -r octgpt/requirements.txt
 
 ### 数据准备
 
-训练/评测数据是 **ShapeNet 经 OctGPT 官方预处理**得到的（OctGPT README 的 ShapeNet 数据准备流程，生成 SDF/八叉树监督所需的点云与 filelist），得到形如 `data/ShapeNet/datasets_256/` 的目录后，在 config 的 `DATA.train.*` / `DATA.test.*` 字段配置路径。只跑生成（不训练）则无需准备数据。
+训练/评测数据完全沿用 **OctGPT 官方的 ShapeNet 预处理流程**（OctGPT README 2.3.1 节），本仓库不做任何额外预处理。只跑生成（不训练）则无需准备数据，跳过本节即可。
+
+1. 从 [ShapeNet](https://shapenet.org/) 下载 `ShapeNetCore.v1.zip`（31G），放到 `data/ShapeNet/ShapeNetCore.v1.zip`；从 HuggingFace [`wst2001/OctGPT`](https://huggingface.co/wst2001/OctGPT) 下载 `ShapeNet` filelist，放到 `data/ShapeNet/filelist`。
+
+2. 把 `ShapeNetCore.v1` 的 mesh 转成 SDF（与 DualOctreeGNN / OctFusion 相同的流程，基于 mesh2sdf），在 `octgpt/` 目录下运行：
+
+   ```bash
+   cd octgpt
+   python tools/sample_sdf.py --mode cpu --dataset ShapeNet
+   ```
+
+   得到 `data/ShapeNet/datasets_256/`（每个模型目录含 `pointcloud.npz` 与 SDF 采样），这一步 CPU 上耗时较长，建议多进程或提前跑好。
+
+3. 本仓库的 config 直接指向预处理产物：`DATA.train.location` / `DATA.test.location` 指向 `datasets_256`，`DATA.train.filelist` / `DATA.test.filelist` 指向对应类别的 filelist（单类如 `train_airplane.txt`，五类为 `train_im_5.txt`）。训练时真值八叉树与叶子 VQ token 监督由 dataloader 在线从点云构建，无需离线缓存。
 
 ## 快速开始
 
