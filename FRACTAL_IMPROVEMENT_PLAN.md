@@ -1,4 +1,4 @@
-# FractalGenerator 改进方案与对照实验设计
+﻿# FractalGenerator 改进方案与对照实验设计
 
 > **目标**: 在保留 1134× 推理加速的前提下，让 FractalGenerator 的训练质量接近 OctGPT 水平（split_acc 0.90+，与 OctGPT 的 0.954 在同等 metric 定义下可比）。
 >
@@ -681,7 +681,7 @@ python main_fractal.py --config $DIR/config.yaml 2>&1 | tee $DIR/train.log
 
 ---
 
-## 7. 给 Claude Code 的执行提示
+## 7. 执行提示
 
 **优先级**：Phase 1 → Phase 2 (并行) → Phase 3 → Phase 4 → Phase 5
 
