@@ -1,6 +1,6 @@
 # v5 Improvement Experiments — Results Table
 
-Baseline tag: `v4-baseline` (commit 700f410). Branch: `feat/v5-flag-scaffolding`.
+Baseline tag: `v4-baseline` (commit af9afac). Branch: `feat/v5-flag-scaffolding`.
 
 Planned base config: `configs/shapenet_frac_im5.yaml` (im_5, 5 categories, 20438 train samples, 20 epochs unless noted). See `FRACTAL_IMPROVEMENT_PLAN.md` for design rationale.
 
