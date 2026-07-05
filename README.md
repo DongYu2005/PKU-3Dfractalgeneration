@@ -92,6 +92,16 @@ pip install -r octgpt/requirements.txt
 | `octgpt_airplane.pth` | 可选。OctGPT 单类 baseline（报告中的速度/质量对比基线） |
 | `octgpt_im5.pth` + `vqvae_large_im5_cond_bsq32.pth` | 可选。OctGPT 类别条件 baseline |
 
+### 训练好的生成器权重
+
+报告中关键实验的最终权重（fp16）已上传北大网盘：[几何计算前沿-ckpts](https://disk.pku.edu.cn/link/AA8B9E5DB110644AB1B6C70A3B26CE7E01)（有效期至 2026-09-01），下载后可直接用 `eval/gen_from_ckpt.py` 生成：
+
+| 文件 | 对应实验 |
+|---|---|
+| `O1_air_overfit.fp16.pth` | O1：单飞机过拟合（oracle 上限对照） |
+| `Q4_sibling_best.fp16.pth` | Q4：sibling attention，单类 airplane 最佳模型 |
+| `R2_im5_full_ep30.fp16.pth` | R2：im-5 五类条件生成，粗层加权 loss，epoch 30 |
+
 ### 数据准备
 
 训练/评测数据完全沿用 **OctGPT 官方的 ShapeNet 预处理流程**（OctGPT README 2.3.1 节），本仓库不做任何额外预处理。只跑生成（不训练）则无需准备数据，跳过本节即可。
